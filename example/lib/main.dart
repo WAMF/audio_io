@@ -100,19 +100,18 @@ class _MyAppState extends State<MyApp> {
         height: 2,
         color: Colors.blueAccent,
       ),
-      onChanged: (AudioIoLatency newValue) {
-        setState(() {
-          _latencyValue = newValue;
-        });
+      onChanged: (AudioIoLatency? newValue) {
+        if (newValue != null) {
+          setState(() {
+            _latencyValue = newValue;
+          });
+        }
       },
-      items: <AudioIoLatency>[
-        AudioIoLatency.Realtime,
-        AudioIoLatency.Balanced,
-        AudioIoLatency.Powersave,
-      ].map<DropdownMenuItem<AudioIoLatency>>((AudioIoLatency value) {
+      items: AudioIoLatency.values
+          .map<DropdownMenuItem<AudioIoLatency>>((AudioIoLatency value) {
         return DropdownMenuItem<AudioIoLatency>(
           value: value,
-          child: Text(_latencyValues[value]),
+          child: Text(_latencyValues[value]!),
         );
       }).toList(),
     );

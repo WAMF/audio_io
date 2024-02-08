@@ -72,8 +72,14 @@ Added null safety
 
 ## 0.1.7
 Performance improvement
+
 ## 0.1.8
 Fix dangling pointer
+
+## 0.1.9
+Small performance improvement
+Remove fonts from example
+Bump SDK version
 
 Upcoming features 
 - More Optimised for RAM and CPU

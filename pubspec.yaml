@@ -1,10 +1,10 @@
 name: audio_io
 description: Very simple interface to provide a stream of audio data for processing/visualising in Flutter
-version: 0.1.8
+version: 0.1.9
 homepage: https://www.wearemobilefirst.com
 
 environment:
-  sdk: ">=2.12.0 <3.0.0"
+  sdk: ">=3.0.0 <4.0.0"
   flutter: ">=1.12.0"
 
 dependencies:
