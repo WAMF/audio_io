@@ -81,8 +81,18 @@ Small performance improvement
 Remove fonts from example
 Bump SDK version
 
+## 0.2.0
+Major Update
+- Added macOS platform support with full audio input/output capabilities
+- Updated minimum SDK requirements: Dart >=3.4.0, Flutter >=3.22.0
+- Fixed ring buffer infinite recursion bug in macOS implementation
+- Added proper entitlements configuration for macOS microphone access
+- Updated documentation with platform-specific setup instructions
+- Improved cross-platform compatibility
+
 Upcoming features 
 - More Optimised for RAM and CPU
 - Support multiple channels
 - Sample rate conversion
 - File sinks for saving and compressing audio
+- Android platform support
