@@ -61,5 +61,75 @@ example/macos/.symlinks/
 example/macos/Flutter/ephemeral/
 example/macos/Flutter/GeneratedPluginRegistrant.swift
 
+# C/C++ build artifacts
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.dll
+*.mod
+*.smod
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.out
+*.app
+*.pch
+*.gch
+*.pth
+
+# CMake
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+*.cmake
+
+# Android NDK build artifacts
+android/.cxx/
+android/.externalNativeBuild/
+android/build/
+android/gradle/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/app/build/
+example/android/.gradle/
+example/android/build/
+example/android/app/build/
+example/android/local.properties
+example/android/.cxx/
+example/android/.externalNativeBuild/
+
+# Generated native library files
+android/src/main/jniLibs/
+example/android/app/src/main/jniLibs/
+
+# IDE - Visual Studio Code
+.vscode/
+*.code-workspace
+
+# IDE - CLion / IntelliJ with C/C++ plugin
+.idea/
+cmake-build-*/
+
+# IDE - Xcode (additional C/C++ specific)
+*.xcworkspace
+*.xcodeproj
+!example/ios/Runner.xcworkspace
+!example/ios/Runner.xcodeproj
+!example/macos/Runner.xcworkspace
+!example/macos/Runner.xcodeproj
+
 # Exceptions to above rules.
 !/packages/flutter_tools/test/data/dart_dependencies_test/**/.packages

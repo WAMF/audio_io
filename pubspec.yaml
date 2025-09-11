@@ -10,6 +10,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  ffi: ^2.1.0
 
 dev_dependencies:
   flutter_test:
@@ -26,3 +27,7 @@ flutter:
         pluginClass: AudioIoPlugin
       macos:
         pluginClass: AudioIoPlugin
+      android:
+        package: com.wearemobilefirst.audio_io
+        pluginClass: AudioIoPlugin
+        ffiPlugin: true
