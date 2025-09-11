@@ -1,9 +1,11 @@
 import 'dart:async';
-import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import 'src/ffi/audio_io_ffi.dart';
+// Conditional imports for platform-specific implementations
+import 'src/audio_io_stub.dart'
+    if (dart.library.io) 'src/audio_io_native.dart'
+    if (dart.library.js_interop) 'src/audio_io_web.dart' as impl;
 
 class _Methods {
   static const start = 'start';
@@ -50,10 +52,8 @@ class AudioIo {
   AudioIoLatency frameSize = AudioIoLatency.Balanced;
   static AudioIo instance = AudioIo();
 
-  // FFI instance for Android/Windows/Linux
-  AudioIoFFI? _ffi;
-  bool get _useFFI =>
-      Platform.isAndroid || Platform.isWindows || Platform.isLinux;
+  // Platform-specific implementation
+  final _impl = impl.createAudioIoImpl();
 
   StreamController<List<double>> _outputController =
       StreamController<List<double>>.broadcast();
@@ -61,23 +61,22 @@ class AudioIo {
       StreamController<List<double>>.broadcast();
 
   Stream<List<double>> get input {
-    if (_useFFI) {
-      return _ffi?.inputAudioStream ?? const Stream.empty();
+    if (_impl.usePlatformImpl) {
+      return _impl.inputAudioStream ?? const Stream.empty();
     }
     return _inputController.stream;
   }
 
   Sink<List<double>> get output {
-    if (_useFFI) {
-      return _ffi?.outputAudioStream ?? StreamController<List<double>>().sink;
+    if (_impl.usePlatformImpl) {
+      return _impl.outputAudioStream ?? StreamController<List<double>>().sink;
     }
     return _outputController.sink;
   }
 
   Future<void> start() async {
-    if (_useFFI) {
-      _ffi = AudioIoFFI.instance;
-      await _ffi!.start();
+    if (_impl.usePlatformImpl) {
+      await _impl.start();
       return;
     }
 
@@ -104,16 +103,16 @@ class AudioIo {
   }
 
   Future<void> stop() async {
-    if (_useFFI) {
-      await _ffi?.stop();
+    if (_impl.usePlatformImpl) {
+      await _impl.stop();
       return;
     }
     await _methods.invokeMethod(_Methods.stop);
   }
 
   Future<Map<String, dynamic>?> getFormat() async {
-    if (_useFFI) {
-      return _ffi?.getFormat();
+    if (_impl.usePlatformImpl) {
+      return _impl.getFormat();
     }
     final value = await _methods.invokeMethod(_Methods.getFormat);
     if (value != null && value is Map<String, dynamic>) {
@@ -123,8 +122,8 @@ class AudioIo {
   }
 
   Future<void> requestLatency(AudioIoLatency option) async {
-    if (_useFFI) {
-      await _ffi?.requestFrameDuration(_presetLatency[option]!);
+    if (_impl.usePlatformImpl) {
+      await _impl.requestFrameDuration(_presetLatency[option]!);
       return;
     }
     return _methods.invokeMethod(
@@ -132,8 +131,8 @@ class AudioIo {
   }
 
   Future<double> currentLatency() async {
-    if (_useFFI) {
-      final latency = await _ffi?.getFrameDuration() ?? 0.01;
+    if (_impl.usePlatformImpl) {
+      final latency = await _impl.getFrameDuration() ?? 0.01;
       return latency * _Constants.millisecPerSec;
     }
     return _methods.invokeMethod(_Methods.getFrameDuration).then((latency) {
@@ -142,8 +141,8 @@ class AudioIo {
   }
 
   void dispose() {
-    if (_useFFI) {
-      _ffi?.stop();
+    if (_impl.usePlatformImpl) {
+      _impl.stop();
       return;
     }
     _outputController.sink.close();

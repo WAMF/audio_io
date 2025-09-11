@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:audio_io/audio_io.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -78,7 +78,8 @@ class _MyAppState extends State<MyApp> {
 
   void startAudio() async {
     try {
-      if (Platform.isAndroid) {
+      // Only check permissions on mobile platforms
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
         final status = await Permission.microphone.request();
         if (!status.isGranted) {
           setState(() {
