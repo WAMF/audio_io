@@ -37,3 +37,7 @@ flutter:
       web:
         pluginClass: AudioIoPlugin
         fileName: audio_io_web.dart
+      linux:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true
