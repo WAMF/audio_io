@@ -132,7 +132,7 @@ class AudioIo {
 
   Future<double> currentLatency() async {
     if (_impl.usePlatformImpl) {
-      final latency = await _impl.getFrameDuration() ?? 0.01;
+      final latency = await _impl.getFrameDuration();
       return latency * _Constants.millisecPerSec;
     }
     return _methods.invokeMethod(_Methods.getFrameDuration).then((latency) {

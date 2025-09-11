@@ -1,7 +1,4 @@
-import 'dart:async';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
-
-import 'src/audio_io_web.dart';
 
 /// Web implementation of the AudioIo plugin
 class AudioIoPlugin {
