@@ -123,13 +123,13 @@ example/android/app/src/main/jniLibs/
 .idea/
 cmake-build-*/
 
-# IDE - Xcode (additional C/C++ specific)
-*.xcworkspace
-*.xcodeproj
-!example/ios/Runner.xcworkspace
-!example/ios/Runner.xcodeproj
-!example/macos/Runner.xcworkspace
-!example/macos/Runner.xcodeproj
+# IDE - Xcode workspace user data
+**/xcuserdata/
+**/xcshareddata/
+**/project.xcworkspace/contents.xcworkspacedata
+**/project.xcworkspace/xcshareddata/
+*.xcworkspace/xcuserdata/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
 
 # Exceptions to above rules.
 !/packages/flutter_tools/test/data/dart_dependencies_test/**/.packages
