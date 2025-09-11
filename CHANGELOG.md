@@ -81,8 +81,34 @@ Small performance improvement
 Remove fonts from example
 Bump SDK version
 
-Upcoming features 
-- More Optimised for RAM and CPU
-- Support multiple channels
-- Sample rate conversion
-- File sinks for saving and compressing audio
+## 0.2.0
+Major Update
+- Added macOS platform support with full audio input/output capabilities
+- Updated minimum SDK requirements: Dart >=3.4.0, Flutter >=3.22.0
+- Fixed ring buffer infinite recursion bug in macOS implementation
+- Added proper entitlements configuration for macOS microphone access
+- Updated documentation with platform-specific setup instructions
+- Improved cross-platform compatibility
+
+## 0.3.0
+Multi-Platform Release
+- Added Android platform support using miniaudio C++ library via FFI
+- Added Web platform support using Web Audio API
+- Added Linux platform support using miniaudio via FFI
+- Added Windows platform support using miniaudio via FFI
+- Implemented configurable audio latency (Realtime/Balanced/Powersave modes)
+- Added real-time volume meter visualization in example app
+- Standardized data format across all platforms (Float64, 48kHz, mono)
+- Fixed microphone permissions handling on Android
+- Improved FFI implementation with proper memory management
+- Added comprehensive .gitignore for C/C++ build artifacts
+- Fixed all analyzer warnings and improved code quality
+- Updated minimum SDK requirements: Dart >=3.0.0, Flutter >=3.10.0
+
+Platform Support:
+- iOS ✅ (Native Swift/AVAudioEngine)
+- macOS ✅ (Native Swift/AVAudioEngine)  
+- Android ✅ (FFI/miniaudio)
+- Web ✅ (Web Audio API)
+- Linux ✅ (FFI/miniaudio)
+- Windows ✅ (FFI/miniaudio)

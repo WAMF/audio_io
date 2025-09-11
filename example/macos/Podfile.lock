@@ -1,0 +1,22 @@
+PODS:
+  - audio_io (0.1.9):
+    - FlutterMacOS
+  - FlutterMacOS (1.0.0)
+
+DEPENDENCIES:
+  - audio_io (from `Flutter/ephemeral/.symlinks/plugins/audio_io/macos`)
+  - FlutterMacOS (from `Flutter/ephemeral`)
+
+EXTERNAL SOURCES:
+  audio_io:
+    :path: Flutter/ephemeral/.symlinks/plugins/audio_io/macos
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+
+SPEC CHECKSUMS:
+  audio_io: 59bc6d188f38cfdf38cae66eeab13b85d6f59107
+  FlutterMacOS: 8f6f14fa908a6fb3fba0cd85dbd81ec4b251fb24
+
+PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009
+
+COCOAPODS: 1.16.2

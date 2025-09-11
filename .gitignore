@@ -25,3 +25,111 @@ doc/api/
 
 .flutter-plugins
 .flutter-plugins-dependencies
+
+# macOS
+*.mode1v3
+*.mode2v3
+*.moved-aside
+*.pbxuser
+*.perspectivev3
+**/*sync/
+.sconsign.dblite
+.tags*
+**/.vagrant/
+**/DerivedData/
+Icon?
+**/Pods/
+**/.symlinks/
+profile
+xcuserdata
+**/.generated/
+Flutter/App.framework
+Flutter/Flutter.framework
+Flutter/Flutter.podspec
+Flutter/Generated.xcconfig
+Flutter/ephemeral/
+Flutter/app.flx
+Flutter/app.zip
+Flutter/flutter_assets/
+Flutter/flutter_export_environment.sh
+ServiceDefinitions.json
+Runner/GeneratedPluginRegistrant.*
+
+# macOS specific - Xcode build artifacts
+example/macos/Pods/
+example/macos/.symlinks/
+example/macos/Flutter/ephemeral/
+example/macos/Flutter/GeneratedPluginRegistrant.swift
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.so
+*.so.*
+*.dylib
+*.dll
+*.mod
+*.smod
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.out
+*.app
+*.pch
+*.gch
+*.pth
+
+# CMake
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+*.cmake
+
+# Android NDK build artifacts
+android/.cxx/
+android/.externalNativeBuild/
+android/build/
+android/gradle/
+android/gradlew
+android/gradlew.bat
+android/local.properties
+android/app/build/
+example/android/.gradle/
+example/android/build/
+example/android/app/build/
+example/android/local.properties
+example/android/.cxx/
+example/android/.externalNativeBuild/
+
+# Generated native library files
+android/src/main/jniLibs/
+example/android/app/src/main/jniLibs/
+
+# IDE - Visual Studio Code
+.vscode/
+*.code-workspace
+
+# IDE - CLion / IntelliJ with C/C++ plugin
+.idea/
+cmake-build-*/
+
+# IDE - Xcode workspace user data
+**/xcuserdata/
+**/xcshareddata/
+**/project.xcworkspace/contents.xcworkspacedata
+**/project.xcworkspace/xcshareddata/
+*.xcworkspace/xcuserdata/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# Exceptions to above rules.
+!/packages/flutter_tools/test/data/dart_dependencies_test/**/.packages
