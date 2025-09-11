@@ -89,6 +89,9 @@ class _MyAppState extends State<MyApp> {
         }
       }
 
+      // Set the latency preference before starting
+      await AudioIo.instance.requestLatency(_latencyValue);
+
       await AudioIo.instance.start();
       _setupAudioProcessing(); // Set up audio processing after starting
 

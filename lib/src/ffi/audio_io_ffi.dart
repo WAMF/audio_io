@@ -18,6 +18,7 @@ class AudioIoFFI {
   Timer? _inputTimer;
 
   bool _isRunning = false;
+  double _requestedFrameDuration = 0.003; // Default to Balanced (3ms)
 
   AudioIoFFI._() {
     _bindings = AudioIoBindings();
@@ -33,6 +34,9 @@ class AudioIoFFI {
     if (_handle == nullptr) {
       throw Exception('Failed to create audio context');
     }
+
+    // Set the frame duration before starting
+    _bindings.setFrameDuration(_handle!, _requestedFrameDuration);
 
     final result = _bindings.start(_handle!);
     if (result != 0) {
@@ -150,9 +154,17 @@ class AudioIoFFI {
     };
   }
 
-  Future<void> requestFrameDuration(double duration) async {}
+  Future<void> requestFrameDuration(double duration) async {
+    _requestedFrameDuration = duration;
+    if (_handle != null && _isRunning) {
+      _bindings.setFrameDuration(_handle!, duration);
+    }
+  }
 
   Future<double> getFrameDuration() async {
+    if (_handle != null) {
+      return _bindings.getFrameDuration(_handle!);
+    }
     return 0.01;
   }
 }

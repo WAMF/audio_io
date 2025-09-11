@@ -37,6 +37,14 @@ typedef AudioIoGetAvailableWriteSpaceNative = Int32 Function(
     Pointer<Void> handle);
 typedef AudioIoGetAvailableWriteSpace = int Function(Pointer<Void> handle);
 
+typedef AudioIoSetFrameDurationNative = Int32 Function(
+    Pointer<Void> handle, Double duration);
+typedef AudioIoSetFrameDuration = int Function(
+    Pointer<Void> handle, double duration);
+
+typedef AudioIoGetFrameDurationNative = Double Function(Pointer<Void> handle);
+typedef AudioIoGetFrameDuration = double Function(Pointer<Void> handle);
+
 class AudioIoBindings {
   late final DynamicLibrary _lib;
 
@@ -50,6 +58,8 @@ class AudioIoBindings {
   late final AudioIoGetChannels getChannels;
   late final AudioIoGetAvailableReadFrames getAvailableReadFrames;
   late final AudioIoGetAvailableWriteSpace getAvailableWriteSpace;
+  late final AudioIoSetFrameDuration setFrameDuration;
+  late final AudioIoGetFrameDuration getFrameDuration;
 
   AudioIoBindings() {
     _lib = _loadLibrary();
@@ -96,6 +106,16 @@ class AudioIoBindings {
     getAvailableWriteSpace = _lib
         .lookup<NativeFunction<AudioIoGetAvailableWriteSpaceNative>>(
             'audio_io_get_available_write_space')
+        .asFunction();
+
+    setFrameDuration = _lib
+        .lookup<NativeFunction<AudioIoSetFrameDurationNative>>(
+            'audio_io_set_frame_duration')
+        .asFunction();
+
+    getFrameDuration = _lib
+        .lookup<NativeFunction<AudioIoGetFrameDurationNative>>(
+            'audio_io_get_frame_duration')
         .asFunction();
   }
 

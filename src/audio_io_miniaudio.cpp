@@ -6,7 +6,9 @@
 #include <atomic>
 #include <vector>
 
-
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 const int RING_BUFFER_SIZE = 8192;
 const int SAMPLE_RATE = 48000;
@@ -64,11 +66,15 @@ struct AudioContext {
     DoubleRingBuffer* inputRingBuffer;
     DoubleRingBuffer* outputRingBuffer;
     std::atomic<bool> isRunning;
+    std::atomic<bool> isDeviceInitialized;
+    double frameDuration;  // Store requested frame duration
     
     AudioContext() 
         : inputRingBuffer(new DoubleRingBuffer(RING_BUFFER_SIZE)),
           outputRingBuffer(new DoubleRingBuffer(RING_BUFFER_SIZE)),
-          isRunning(false) {}
+          isRunning(false),
+          isDeviceInitialized(false),
+          frameDuration(0.003) {}  // Default 3ms (Balanced)
     
     ~AudioContext() {
         delete inputRingBuffer;
@@ -107,6 +113,28 @@ extern "C" {
 void* audio_io_create() {
 
     AudioContext* context = new AudioContext();
+    return context;  // Don't initialize device yet, wait for set_frame_duration
+}
+
+void* audio_io_create_with_latency(double frameDuration) {
+    AudioContext* context = new AudioContext();
+    context->frameDuration = frameDuration;
+    return context;
+}
+
+int audio_io_init_device(void* handle) {
+    if (!handle) return -1;
+    
+    AudioContext* context = (AudioContext*)handle;
+    
+    // Calculate period size in frames based on frame duration
+    ma_uint32 periodSizeInFrames = (ma_uint32)(context->frameDuration * SAMPLE_RATE);
+    
+    // Clamp to reasonable values (64 to 4096 frames)
+    if (periodSizeInFrames < 64) periodSizeInFrames = 64;
+    if (periodSizeInFrames > 4096) periodSizeInFrames = 4096;
+    
+
     
     ma_device_config config = ma_device_config_init(ma_device_type_duplex);
     config.capture.pDeviceID = NULL;
@@ -120,20 +148,31 @@ void* audio_io_create() {
     config.sampleRate = SAMPLE_RATE;
     config.dataCallback = data_callback;
     config.pUserData = context;
+    config.periodSizeInFrames = periodSizeInFrames;
     
     #ifdef __ANDROID__
-    config.performanceProfile = ma_performance_profile_low_latency;
+    // Set performance profile based on latency
+    if (context->frameDuration <= 0.002) {
+        config.performanceProfile = ma_performance_profile_low_latency;
+    } else if (context->frameDuration <= 0.004) {
+        config.performanceProfile = ma_performance_profile_conservative;
+    } else {
+        config.performanceProfile = ma_performance_profile_low_latency;  // Still prefer low latency
+    }
     config.aaudio.usage = ma_aaudio_usage_media;
     config.aaudio.contentType = ma_aaudio_content_type_music;
+    config.periods = 2;  // Use double buffering
     #endif
     
     if (ma_device_init(NULL, &config, &context->device) != MA_SUCCESS) {
-
-        delete context;
-        return NULL;
+        return -1;
     }
+    
+    context->isDeviceInitialized = true;
+    
 
-    return context;
+    
+    return 0;
 }
 
 void audio_io_destroy(void* handle) {
@@ -145,7 +184,9 @@ void audio_io_destroy(void* handle) {
         ma_device_stop(&context->device);
     }
     
-    ma_device_uninit(&context->device);
+    if (context->isDeviceInitialized) {
+        ma_device_uninit(&context->device);
+    }
     delete context;
 }
 
@@ -156,9 +197,14 @@ int audio_io_start(void* handle) {
     
     if (context->isRunning) return 0;
     
-
+    // Initialize device if not already done
+    if (!context->isDeviceInitialized) {
+        if (audio_io_init_device(handle) != 0) {
+            return -1;
+        }
+    }
+    
     if (ma_device_start(&context->device) != MA_SUCCESS) {
-
         return -1;
     }
 
@@ -218,6 +264,44 @@ int audio_io_get_available_write_space(void* handle) {
     
     AudioContext* context = (AudioContext*)handle;
     return context->outputRingBuffer->available_write();
+}
+
+int audio_io_set_frame_duration(void* handle, double duration) {
+    if (!handle) return -1;
+    
+    AudioContext* context = (AudioContext*)handle;
+    
+    // If device is already running, we can't change the buffer size
+    if (context->isRunning) return -1;
+    
+    // Store the new frame duration
+    context->frameDuration = duration;
+    
+    // If device is already initialized, uninitialize it so it will be re-initialized with new settings
+    if (context->isDeviceInitialized) {
+        ma_device_uninit(&context->device);
+        context->isDeviceInitialized = false;
+    }
+    
+    return 0;
+}
+
+double audio_io_get_frame_duration(void* handle) {
+    if (!handle) return 0.003;  // Return default if handle is null
+    
+    AudioContext* context = (AudioContext*)handle;
+    
+    // If device is initialized, return actual period size
+    if (context->isDeviceInitialized && context->isRunning) {
+        // Get actual buffer size from device
+        ma_uint32 actualBufferSize = context->device.playback.internalPeriodSizeInFrames;
+        if (actualBufferSize > 0) {
+            return (double)actualBufferSize / (double)context->device.sampleRate;
+        }
+    }
+    
+    // Return configured value
+    return context->frameDuration;
 }
 
 } // extern "C"
