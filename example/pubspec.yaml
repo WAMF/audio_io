@@ -10,12 +10,12 @@ dependencies:
     sdk: flutter
   permission_handler: ^11.3.1
 
+  audio_io: any
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
-
-  audio_io:
-    path: ../
+  flutter_lints: ^5.0.0
 
 flutter:
   uses-material-design: true

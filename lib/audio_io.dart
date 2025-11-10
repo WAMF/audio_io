@@ -67,9 +67,11 @@ class AudioIo {
     return _inputController.stream;
   }
 
+  static final _fallbackController = StreamController<List<double>>();
+
   Sink<List<double>> get output {
     if (_impl.usePlatformImpl) {
-      return _impl.outputAudioStream ?? StreamController<List<double>>().sink;
+      return _impl.outputAudioStream ?? _fallbackController.sink;
     }
     return _outputController.sink;
   }
@@ -84,7 +86,9 @@ class AudioIo {
     _outputSubscription?.cancel();
     _inputSubscription?.cancel();
     _outputSubscription = _outputController.stream.listen((output) {
-      final outData = ByteData.view(Float64List.fromList(output).buffer);
+      final buffer =
+          output is Float64List ? output : Float64List.fromList(output);
+      final outData = ByteData.view(buffer.buffer);
       ServicesBinding.instance.defaultBinaryMessenger
           .send(_Channels.audioOutput, outData);
     });
@@ -107,6 +111,10 @@ class AudioIo {
       await _impl.stop();
       return;
     }
+    _outputSubscription?.cancel();
+    _outputSubscription = null;
+    ServicesBinding.instance.defaultBinaryMessenger
+        .setMessageHandler(_Channels.audioInput, null);
     await _methods.invokeMethod(_Methods.stop);
   }
 

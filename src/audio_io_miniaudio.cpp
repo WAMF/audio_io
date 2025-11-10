@@ -102,7 +102,15 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
         size_t framesRead = context->outputRingBuffer->read(tempBuffer.data(), frameCount);
         
         for (ma_uint32 i = 0; i < frameCount; i++) {
-            floatOutput[i] = (i < framesRead) ? (float)tempBuffer[i] : 0.0f;
+            if (i < framesRead) {
+                double sample = tempBuffer[i];
+                // Clamp to [-1.0, 1.0] to prevent clipping
+                if (sample > 1.0) sample = 1.0;
+                else if (sample < -1.0) sample = -1.0;
+                floatOutput[i] = (float)sample;
+            } else {
+                floatOutput[i] = 0.0f;
+            }
         }
 
     }
@@ -271,16 +279,37 @@ int audio_io_set_frame_duration(void* handle, double duration) {
     
     AudioContext* context = (AudioContext*)handle;
     
-    // If device is already running, we can't change the buffer size
-    if (context->isRunning) return -1;
-    
     // Store the new frame duration
     context->frameDuration = duration;
     
-    // If device is already initialized, uninitialize it so it will be re-initialized with new settings
-    if (context->isDeviceInitialized) {
-        ma_device_uninit(&context->device);
-        context->isDeviceInitialized = false;
+    // If device is running, we need to restart it with new buffer size
+    if (context->isRunning) {
+        // Stop the device
+        ma_device_stop(&context->device);
+        context->isRunning = false;
+        
+        // Uninitialize the device
+        if (context->isDeviceInitialized) {
+            ma_device_uninit(&context->device);
+            context->isDeviceInitialized = false;
+        }
+        
+        // Re-initialize with new settings
+        if (audio_io_init_device(handle) != 0) {
+            return -1;
+        }
+        
+        // Restart the device
+        if (ma_device_start(&context->device) != MA_SUCCESS) {
+            return -1;
+        }
+        context->isRunning = true;
+    } else {
+        // If device is already initialized but not running, uninitialize it
+        if (context->isDeviceInitialized) {
+            ma_device_uninit(&context->device);
+            context->isDeviceInitialized = false;
+        }
     }
     
     return 0;

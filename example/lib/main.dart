@@ -16,17 +16,20 @@ final _latencyValues = {
 };
 
 class MyApp extends StatefulWidget {
+  const MyApp({super.key});
+
   @override
-  _MyAppState createState() => _MyAppState();
+  MyAppState createState() => MyAppState();
 }
 
-class _MyAppState extends State<MyApp> {
+class MyAppState extends State<MyApp> {
   String _status = 'Unknown';
   AudioIoLatency _latencyValue = AudioIoLatency.Balanced;
   double _inputLevel = 0.0;
   DateTime _lastVolumeUpdate = DateTime.now();
-  static const _volumeUpdateInterval = Duration(milliseconds: 33); // ~30 FPS
+  static const _volumeUpdateInterval = Duration(milliseconds: 33);
   StreamSubscription<List<double>>? _audioSubscription;
+  bool _isRunning = false;
 
   @override
   void initState() {
@@ -51,7 +54,6 @@ class _MyAppState extends State<MyApp> {
   void _setupAudioProcessing() {
     _audioSubscription?.cancel();
     _audioSubscription = AudioIo.instance.input.listen((data) {
-      // Calculate RMS (Root Mean Square) for volume level
       final now = DateTime.now();
       if (now.difference(_lastVolumeUpdate) >= _volumeUpdateInterval) {
         double sum = 0;
@@ -60,7 +62,6 @@ class _MyAppState extends State<MyApp> {
         }
         final rms = data.isEmpty ? 0.0 : sqrt(sum / data.length);
 
-        // Update UI with amplified value for better visualization
         if (mounted) {
           setState(() {
             _inputLevel = (rms * 5.0).clamp(0.0, 1.0);
@@ -69,10 +70,7 @@ class _MyAppState extends State<MyApp> {
         }
       }
 
-      final out = List<double>.generate(
-          data.length, (index) => data[index] * 0.9); // do things :)
-      AudioIo.instance.output
-          .add(out); // send back out to output (headset speaker or headphones)
+      AudioIo.instance.output.add(data);
     });
   }
 
@@ -100,10 +98,12 @@ class _MyAppState extends State<MyApp> {
       await AudioIo.instance.getFormat();
       setState(() {
         _status = 'Started ($lstring ms)';
+        _isRunning = true;
       });
     } on PlatformException {
       setState(() {
         _status = 'Failed';
+        _isRunning = false;
       });
     }
   }
@@ -116,10 +116,12 @@ class _MyAppState extends State<MyApp> {
       setState(() {
         _status = 'Stopped';
         _inputLevel = 0.0;
+        _isRunning = false;
       });
     } on PlatformException {
       setState(() {
         _status = 'Failed';
+        _isRunning = false;
       });
     }
   }
@@ -178,13 +180,15 @@ class _MyAppState extends State<MyApp> {
           height: 2,
           color: Colors.blueAccent,
         ),
-        onChanged: (AudioIoLatency? newValue) {
-          if (newValue != null) {
-            setState(() {
-              _latencyValue = newValue;
-            });
-          }
-        },
+        onChanged: _isRunning
+            ? null
+            : (AudioIoLatency? newValue) {
+                if (newValue != null) {
+                  setState(() {
+                    _latencyValue = newValue;
+                  });
+                }
+              },
         items: AudioIoLatency.values
             .map<DropdownMenuItem<AudioIoLatency>>((AudioIoLatency value) {
           return DropdownMenuItem<AudioIoLatency>(

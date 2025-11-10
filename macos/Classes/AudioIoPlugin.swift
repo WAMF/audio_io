@@ -19,6 +19,7 @@ enum _Constants {
     static let defaultFrameDuration = 0.003
     static let defaultMaxFrameJitter = 4.0
     static let processingQueueName = "SwiftAudioIoPluginQueue"
+    static let ringBufferSize = 2048
 }
 
 enum Methods: String {
@@ -65,56 +66,76 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
 
     private var sourceNode: AVAudioSourceNode?
 
-    private func createSourceNode() -> AVAudioSourceNode {
-        let format = AVAudioFormat(commonFormat: .pcmFormatFloat64, sampleRate: _sampleRate, channels: 1, interleaved: false)!
-        return AVAudioSourceNode(format: format, renderBlock: { _, _, frameCount, audioBufferList -> OSStatus in
-            let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            self.queue.sync {
-                for buffer in ablPointer {
-                    let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(buffer)
-                    var i = 0
-                    while i < frameCount {
-                        buf[i] = self.buffer.read() ?? 0
-                        i += 1
-                    }
-                }
-            }
-            return noErr
-        })
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        engine.stop()
     }
 
-    private lazy var sinkNode = AVAudioSinkNode { _, frames, audioBufferList ->
-        OSStatus in
+    private func createSourceNode() -> AVAudioSourceNode {
+        let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat64, sampleRate: _sampleRate, channels: 1,
+            interleaved: false)!
+        return AVAudioSourceNode(
+            format: format,
+            renderBlock: { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
+                guard let self = self else { return noErr }
+                let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
+                self.queue.sync {
+                    for buffer in ablPointer {
+                        let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(
+                            buffer)
+                        var i = 0
+                        while i < frameCount {
+                            buf[i] = self.buffer.read() ?? 0
+                            i += 1
+                        }
+                    }
+                }
+                return noErr
+            })
+    }
+
+    private lazy var sinkNode = AVAudioSinkNode { [weak self] _, frames, audioBufferList -> OSStatus in
+        guard let self = self else { return noErr }
         let sampleCount = Int(frames)
-        var doubleSamples = [Double](repeating: 0.0, count: sampleCount)
-        let ptr = audioBufferList.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self)
-        let unsafePtr = UnsafeBufferPointer(start: ptr, count: sampleCount)
-        var i = 0
-        while i < sampleCount {
-            doubleSamples[i] = Double(unsafePtr[i])
-            i += 1
+        guard let ptr = audioBufferList.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self) else {
+            return noErr
         }
-        let data = Data(fromArray: doubleSamples)
-        self._binaryMessenger?.send(onChannel: Channels.inputChannelName.rawValue, message: data)
+
+        var doubleData = Data(count: sampleCount * MemoryLayout<Double>.stride)
+        doubleData.withUnsafeMutableBytes { doublePtr in
+            let doubles = doublePtr.bindMemory(to: Double.self)
+            for i in 0..<sampleCount {
+                doubles[i] = Double(ptr[i])
+            }
+        }
+
+        self._binaryMessenger?.send(
+            onChannel: Channels.inputChannelName.rawValue, message: doubleData)
         return noErr
     }
 
     public static func register(with registrar: FlutterPluginRegistrar) {
-        let channel = FlutterMethodChannel(name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger)
+        let channel = FlutterMethodChannel(
+            name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger)
         let instance = AudioIoPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
         instance._binaryMessenger = registrar.messenger
-        instance._binaryMessenger?.setMessageHandlerOnChannel(Channels.outputChannelName.rawValue, binaryMessageHandler: { data, _ in
-            guard let data = data else {
-                return
-            }
-            instance.queue.async {
-                let doubles: [Double] = data.toArray(type: Double.self)
-                _ = instance.buffer.writeBlock(doubles)
-            }
-        })
+        instance._binaryMessenger?.setMessageHandlerOnChannel(
+            Channels.outputChannelName.rawValue,
+            binaryMessageHandler: { [weak instance] data, _ in
+                guard let data = data, let instance = instance else {
+                    return
+                }
+                instance.queue.async {
+                    let doubles: [Double] = data.toArray(type: Double.self)
+                    _ = instance.buffer.writeBlock(doubles)
+                }
+            })
 
-        NotificationCenter.default.addObserver(instance, selector: #selector(handleConfigChange), name: NSNotification.Name.AVAudioEngineConfigurationChange, object: nil)
+        NotificationCenter.default.addObserver(
+            instance, selector: #selector(handleConfigChange),
+            name: NSNotification.Name.AVAudioEngineConfigurationChange, object: nil)
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -128,6 +149,13 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         case Methods.requestFrameDuration.rawValue:
             if let requested = call.arguments as? Double {
                 _frameDuration = requested
+                // Update the ring buffer size if running
+                if _isRunning {
+                    buffer = RingBuffer<Double>(
+                        count: max(
+                            _Constants.ringBufferSize,
+                            Int(_frameDuration * _sampleRate * maxFrameJitter)))
+                }
             }
             result(nil)
         case Methods.getFrameDuration.rawValue:
@@ -140,19 +168,19 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     public func stop() {
-        print("Stop Audio Engine")
         engine.stop()
         _isRunning = false
+        buffer.clear()
     }
 
     public func start() {
-        print("Start Audio Engine")
-        buffer = RingBuffer<Double>(count: Int(_frameDuration * _sampleRate * maxFrameJitter))
+        buffer = RingBuffer<Double>(
+            count: max(
+                _Constants.ringBufferSize, Int(_frameDuration * _sampleRate * maxFrameJitter)))
 
         do {
             try setupPipelineIfNeeded()
         } catch {
-            print("Audio pipeline error \(error)")
             return
         }
 
@@ -162,20 +190,21 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             try engine.start()
             _isRunning = true
         } catch {
-            print("Audio start error")
         }
     }
 
     public func setupPipelineIfNeeded() throws {
         if !_isPipelineSetup {
-            print("setupPipeline")
             let input = engine.inputNode
             let output = engine.mainMixerNode
             let inputFormat = input.inputFormat(forBus: 0)
             _sampleRate = inputFormat.sampleRate
             inputConverter.outputVolume = 1.0
+
             let sourceNode = createSourceNode()
-            let processingformat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1, interleaved: false)
+            let processingformat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1,
+                interleaved: false)
             engine.attach(inputConverter)
             engine.attach(sinkNode)
             engine.attach(sourceNode)
@@ -184,12 +213,10 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             engine.connect(sourceNode, to: output, format: nil)
             self.sourceNode = sourceNode
             _isPipelineSetup = true
-            print("setupPipeline complete")
         }
     }
 
     public func detachPipeline() {
-        print("detachPipeline")
         engine.detach(inputConverter)
         engine.detach(sinkNode)
         if let sourceNode = sourceNode {
@@ -199,14 +226,12 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     @objc func handleConfigChange(notification _: NSNotification) {
-        print("handleConfigChange:")
         resetAudio()
     }
 
     public func resetAudio() {
         if _isRunning && !_resetting {
             _resetting = true
-            print("Resetting Audio Engine")
             engine.stop()
             detachPipeline()
             DispatchQueue.main.async {
@@ -217,13 +242,17 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     public func getFormat() -> [String: Any] {
-        let inputDesc: [String: Any] = [_AudioFormat.dataType: AudioDataTypes.double.rawValue,
-                                        _AudioFormat.channels: 1,
-                                        _AudioFormat.sampleRate: _sampleRate]
+        let inputDesc: [String: Any] = [
+            _AudioFormat.dataType: AudioDataTypes.double.rawValue,
+            _AudioFormat.channels: 1,
+            _AudioFormat.sampleRate: _sampleRate,
+        ]
 
-        let outputDesc: [String: Any] = [_AudioFormat.dataType: AudioDataTypes.double.rawValue,
-                                         _AudioFormat.channels: 1,
-                                         _AudioFormat.sampleRate: _sampleRate]
+        let outputDesc: [String: Any] = [
+            _AudioFormat.dataType: AudioDataTypes.double.rawValue,
+            _AudioFormat.channels: 1,
+            _AudioFormat.sampleRate: _sampleRate,
+        ]
 
         return [_AudioFormat.input: inputDesc, _AudioFormat.output: outputDesc]
     }
@@ -241,7 +270,7 @@ public struct RingBuffer<T> {
     public mutating func write(_ element: T) -> Bool {
         if !isFull {
             array[writeIndex % array.count] = element
-            writeIndex += 1
+            writeIndex = (writeIndex + 1) % (array.count * 2)
             return true
         } else {
             return false
@@ -257,21 +286,22 @@ public struct RingBuffer<T> {
         let writeStartIndex = writeIndex % array.count
 
         if writeStartIndex + count <= array.count {
-            array.replaceSubrange(writeStartIndex ..< writeStartIndex + count, with: block)
+            array.replaceSubrange(writeStartIndex..<writeStartIndex + count, with: block)
         } else {
             let firstPartCount = array.count - writeStartIndex
-            array.replaceSubrange(writeStartIndex ..< writeStartIndex + firstPartCount, with: block[..<firstPartCount])
-            array.replaceSubrange(0 ..< count - firstPartCount, with: block[firstPartCount...])
+            array.replaceSubrange(
+                writeStartIndex..<writeStartIndex + firstPartCount, with: block[..<firstPartCount])
+            array.replaceSubrange(0..<count - firstPartCount, with: block[firstPartCount...])
         }
 
-        writeIndex += count
+        writeIndex = (writeIndex + count) % (array.count * 2)
         return true
     }
 
     public mutating func read() -> T? {
         if !isEmpty {
             let element = array[readIndex % array.count]
-            readIndex += 1
+            readIndex = (readIndex + 1) % (array.count * 2)
             return element
         } else {
             return nil
@@ -281,10 +311,10 @@ public struct RingBuffer<T> {
     public mutating func readBlock(count: Int) -> [T?]? {
         if availableSpaceForReading >= count {
             var result = [T?](repeating: nil, count: count)
-            for i in 0 ..< count {
+            for i in 0..<count {
                 result[i] = array[(readIndex + i) % array.count]
             }
-            readIndex += count
+            readIndex = (readIndex + count) % (array.count * 2)
             return result
         }
         return nil
@@ -312,12 +342,12 @@ public struct RingBuffer<T> {
     }
 }
 
-public extension Double {
-    static var random: Double {
+extension Double {
+    public static var random: Double {
         return Double(arc4random()) / 0xFFFF_FFFF
     }
 
-    static func random(min: Double, max: Double) -> Double {
+    public static func random(min: Double, max: Double) -> Double {
         return Double.random * (max - min) + min
     }
 }

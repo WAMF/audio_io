@@ -112,3 +112,45 @@ Platform Support:
 - Web ✅ (Web Audio API)
 - Linux ✅ (FFI/miniaudio)
 - Windows ✅ (FFI/miniaudio)
+
+## 0.3.1
+Performance & Stability Update
+
+Critical Memory Leak Fixes:
+- Fixed catastrophic memory leak from DispatchQueue.main.async accumulation in audio callbacks (iOS/macOS)
+- Fixed retain cycle in plugin instance preventing deallocation (iOS/macOS)
+- Fixed retain cycles in audio node callbacks by using weak self references (iOS/macOS)
+- Fixed NotificationCenter observer leak by adding proper deinit cleanup (iOS/macOS)
+- Fixed ring buffer index overflow that would cause eventual corruption
+- Fixed StreamController memory leak in Dart output sink fallback
+- Added proper cleanup of binary message handlers on stop
+- Added buffer.clear() on stop to release memory immediately
+- Optimized audio buffer conversion to reduce allocations per frame
+
+Performance Improvements:
+- Optimized audio pipeline to use Float64 throughout iOS/macOS, eliminating unnecessary Float32→Float64 conversions
+- Removed unnecessary thread dispatch from audio callbacks, eliminating unbounded queue growth
+- Reduced CPU overhead by eliminating Float32→Float64 conversion in audio processing
+- Optimized buffer sizes based on latency mode (256-4096 samples)
+- Improved thread synchronization for audio callbacks
+- Optimized Dart output stream to avoid unnecessary Float64List allocations
+- Eliminated per-frame List allocations in example app audio processing
+
+Bug Fixes:
+- Fixed critical pipeline setup bug in iOS/macOS (_isPipelineSetup flag now properly set)
+- Fixed audio format mismatch crash on iOS/macOS (AVAudioEngine Float32 compatibility)
+- Fixed latency change handling on miniaudio platforms (now properly restarts with new buffer)
+- Fixed Web platform getFrameDuration calculation before audio start
+- Fixed example app pubspec.yaml formatting issues
+- Added missing flutter_lints dependency to example app
+
+Platform Improvements:
+- Added clipping protection for miniaudio platforms (Linux/Windows/Android) to prevent audio distortion
+- Implemented dynamic latency switching without restart on all platforms
+- Fixed Web platform buffer size configuration based on latency settings
+- Improved ring buffer size management with minimum size guarantee
+
+Code Quality:
+- Fixed analyzer warnings and applied dart fix recommendations
+- Removed debug print statements from production code
+- Disabled latency dropdown in example app when audio is running

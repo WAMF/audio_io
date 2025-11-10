@@ -73,6 +73,9 @@ class AudioIoWeb implements AudioIoImpl {
   StreamController<List<double>>? _outputController;
   List<double> _outputBuffer = [];
   bool _isRunning = false;
+  double _requestedFrameDuration = 0.003; // Default 3ms (Balanced)
+  int _bufferSize =
+      2048; // Default buffer size (matches previous hardcoded value)
 
   @override
   bool get usePlatformImpl => true;
@@ -82,6 +85,23 @@ class AudioIoWeb implements AudioIoImpl {
 
   @override
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
+
+  // Calculate optimal buffer size based on requested frame duration
+  int _calculateBufferSize(double sampleRate) {
+    // ScriptProcessorNode requires power of 2: 256, 512, 1024, 2048, 4096, 8192, 16384
+    final targetSamples = (_requestedFrameDuration * sampleRate).round();
+
+    // Find the closest power of 2
+    const validSizes = [256, 512, 1024, 2048, 4096, 8192, 16384];
+
+    for (int size in validSizes) {
+      if (size >= targetSamples) {
+        return size;
+      }
+    }
+
+    return 4096; // Default fallback
+  }
 
   @override
   Future<void> start() async {
@@ -96,9 +116,14 @@ class AudioIoWeb implements AudioIoImpl {
         await _audioContext!.resume().toDart;
       }
 
-      // Create script processor for audio processing
-      // Buffer size of 2048, 1 input channel, 1 output channel
-      _scriptProcessor = _audioContext!.createScriptProcessor(2048, 1, 1);
+      // Calculate optimal buffer size based on sample rate and requested latency
+      final sampleRate = _audioContext!.sampleRate;
+      _bufferSize = _calculateBufferSize(sampleRate);
+
+      // Create script processor with calculated buffer size
+      // Buffer size, 1 input channel, 1 output channel
+      _scriptProcessor =
+          _audioContext!.createScriptProcessor(_bufferSize, 1, 1);
 
       _inputController = StreamController<List<double>>.broadcast();
       _outputController = StreamController<List<double>>();
@@ -113,7 +138,6 @@ class AudioIoWeb implements AudioIoImpl {
         final audioEvent = event as AudioProcessingEvent;
         final inputBuffer = audioEvent.inputBuffer;
         final outputBuffer = audioEvent.outputBuffer;
-
         final bufferLength = inputBuffer.length;
 
         // Get input data
@@ -167,7 +191,7 @@ class AudioIoWeb implements AudioIoImpl {
           .toDart;
       return stream;
     } catch (e) {
-      print('Failed to get user media: $e');
+      // Failed to get user media
       return null;
     }
   }
@@ -177,13 +201,10 @@ class AudioIoWeb implements AudioIoImpl {
     if (!_isRunning) return;
 
     _isRunning = false;
-
     _scriptProcessor?.disconnect();
     _scriptProcessor = null;
-
     await _audioContext?.close().toDart;
     _audioContext = null;
-
     await _inputController?.close();
     await _outputController?.close();
     _inputController = null;
@@ -194,7 +215,6 @@ class AudioIoWeb implements AudioIoImpl {
   @override
   Map<String, dynamic> getFormat() {
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
-
     return {
       'input': {
         'type': 'double',
@@ -211,14 +231,23 @@ class AudioIoWeb implements AudioIoImpl {
 
   @override
   Future<void> requestFrameDuration(double duration) async {
-    // Web Audio API uses fixed buffer sizes
+    _requestedFrameDuration = duration;
+
+    // If already running, restart with new buffer size
+    if (_isRunning) {
+      await stop();
+      await start();
+    }
   }
 
   @override
   Future<double> getFrameDuration() async {
-    // 2048 samples at 48kHz = ~42.67ms
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
-    return 2048 / sampleRate;
+    // If not running, calculate what the buffer size would be
+    final actualBufferSize =
+        _isRunning ? _bufferSize : _calculateBufferSize(sampleRate);
+
+    return actualBufferSize / sampleRate;
   }
 }
 
