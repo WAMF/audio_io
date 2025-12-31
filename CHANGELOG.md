@@ -114,27 +114,51 @@ Platform Support:
 - Windows ✅ (FFI/miniaudio)
 
 ## 0.3.1
-Performance & Stability Update
+Performance, Stability & Error Handling Update
+
+Permission Handling:
+- Added graceful error handling when microphone permission is not granted (iOS/macOS)
+- Plugin now throws AudioIoException with clear message instead of crashing
+- Added AudioIoException class with isPermissionDenied helper for easy error handling
+- Permission errors clearly state that permission handling is the app's responsibility
+
+Threading Fix:
+- Fixed critical threading crash on macOS where platform channel messages were sent from audio thread
+- Binary messages now dispatched to main thread before sending to Flutter (iOS/macOS)
+
+API Additions:
+- Added AudioIoException class for typed error handling
+- AudioIoException.isPermissionDenied getter for checking permission errors
+- AudioIoException includes code, message, and optional details
 
 Critical Memory Leak Fixes:
+- Implemented buffer pool for Data objects to eliminate real-time allocations in audio callbacks (iOS/macOS)
 - Fixed catastrophic memory leak from DispatchQueue.main.async accumulation in audio callbacks (iOS/macOS)
+- Fixed memory accumulation from queue.async in output message handler by switching to sync (iOS/macOS)
+- Added autoreleasepool to audio callbacks and message handlers to ensure immediate memory release (iOS/macOS)
 - Fixed retain cycle in plugin instance preventing deallocation (iOS/macOS)
 - Fixed retain cycles in audio node callbacks by using weak self references (iOS/macOS)
 - Fixed NotificationCenter observer leak by adding proper deinit cleanup (iOS/macOS)
+- Fixed ByteData reference chain leak by copying audio data instead of creating views
 - Fixed ring buffer index overflow that would cause eventual corruption
 - Fixed StreamController memory leak in Dart output sink fallback
 - Added proper cleanup of binary message handlers on stop
 - Added buffer.clear() on stop to release memory immediately
 - Optimized audio buffer conversion to reduce allocations per frame
+- Made stream controllers synchronous to prevent event queue buildup
+- Optimized Dart input processing to skip allocations when no listener present
+- Eliminated Data array allocation in output handler by writing directly from buffer (iOS/macOS)
 
 Performance Improvements:
 - Optimized audio pipeline to use Float64 throughout iOS/macOS, eliminating unnecessary Float32→Float64 conversions
 - Removed unnecessary thread dispatch from audio callbacks, eliminating unbounded queue growth
+- Removed expensive DateTime operations from per-frame Dart message handler
 - Reduced CPU overhead by eliminating Float32→Float64 conversion in audio processing
 - Optimized buffer sizes based on latency mode (256-4096 samples)
 - Improved thread synchronization for audio callbacks
 - Optimized Dart output stream to avoid unnecessary Float64List allocations
 - Eliminated per-frame List allocations in example app audio processing
+- Minimized per-frame allocations in Dart message handler for better throughput
 
 Bug Fixes:
 - Fixed critical pipeline setup bug in iOS/macOS (_isPipelineSetup flag now properly set)
@@ -154,3 +178,6 @@ Code Quality:
 - Fixed analyzer warnings and applied dart fix recommendations
 - Removed debug print statements from production code
 - Disabled latency dropdown in example app when audio is running
+
+Diagnostics:
+- Added ring buffer overflow detection with logging (iOS/macOS)

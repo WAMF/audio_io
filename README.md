@@ -32,7 +32,7 @@ Add `audio_io` to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  audio_io: ^0.3.0
+  audio_io: ^0.3.1
 ```
 
 ### iOS Setup
@@ -70,7 +70,25 @@ Add microphone permission to your `android/app/src/main/AndroidManifest.xml`:
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
 ```
 
-The plugin will automatically request the permission at runtime when needed.
+### Permissions
+
+This plugin requires microphone permission to function. **Permission handling is the responsibility of your app** - the plugin does not request permissions automatically.
+
+Use a package like [permission_handler](https://pub.dev/packages/permission_handler) to request microphone permission before calling `start()`:
+
+```dart
+import 'package:permission_handler/permission_handler.dart';
+
+// Request permission before starting audio
+final status = await Permission.microphone.request();
+if (status.isGranted) {
+  await AudioIo.instance.start();
+} else {
+  // Handle permission denied
+}
+```
+
+If you call `start()` without microphone permission, an `AudioIoException` will be thrown with a clear error message.
 
 ### Usage
 
@@ -104,6 +122,24 @@ audioIo.input.listen((data) {
 
 // Stop audio processing
 await audioIo.stop();
+```
+
+### Error Handling
+
+The plugin throws `AudioIoException` for errors. Use `isPermissionDenied` to check for permission issues:
+
+```dart
+try {
+  await AudioIo.instance.start();
+} on AudioIoException catch (e) {
+  if (e.isPermissionDenied) {
+    // Microphone permission not granted
+    print('Please grant microphone permission');
+  } else {
+    // Other audio errors (session, engine)
+    print('Audio error: ${e.message}');
+  }
+}
 ```
 
 ### Latency Configuration

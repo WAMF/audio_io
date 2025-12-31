@@ -31,6 +31,15 @@ enum Methods: String {
     case getFormat
 }
 
+enum AudioIoError {
+    static let permissionDeniedCode = "MICROPHONE_PERMISSION_DENIED"
+    static let permissionDeniedMessage = "Microphone permission not granted. This plugin requires microphone access to function. Please request microphone permission using a package like permission_handler before calling start()."
+    static let audioSessionCode = "AUDIO_SESSION_ERROR"
+    static let audioSessionMessage = "Failed to configure audio session"
+    static let engineStartCode = "ENGINE_START_ERROR"
+    static let engineStartMessage = "Failed to start audio engine"
+}
+
 enum Channels: String {
     case inputChannelName = "com.wearemobilefirst.audio_io.inputAudio"
     case outputChannelName = "com.wearemobilefirst.audio_io.outputAudio"
@@ -51,6 +60,39 @@ enum _AudioFormat {
     static let output = "output"
 }
 
+class DataBufferPool {
+    private var pool: [Data] = []
+    private let bufferSize: Int
+    private let poolSize: Int
+    private let queue = DispatchQueue(label: "DataBufferPool")
+
+    init(bufferSize: Int, poolSize: Int = 8) {
+        self.bufferSize = bufferSize
+        self.poolSize = poolSize
+        for _ in 0..<poolSize {
+            pool.append(Data(count: bufferSize))
+        }
+    }
+
+    func acquire() -> Data {
+        return queue.sync {
+            if pool.isEmpty {
+                return Data(count: bufferSize)
+            }
+            return pool.removeLast()
+        }
+    }
+
+    func release(_ data: Data) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            if self.pool.count < self.poolSize {
+                self.pool.append(data)
+            }
+        }
+    }
+}
+
 public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     let engine = AVAudioEngine()
     var inputConverter = AVAudioMixerNode()
@@ -63,6 +105,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     var _isRunning = false
     var _isPipelineSetup = false
     var _resetting = false
+    var bufferPool: DataBufferPool?
 
     private var sourceNode: AVAudioSourceNode?
 
@@ -102,7 +145,13 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             return noErr
         }
 
-        var doubleData = Data(count: sampleCount * MemoryLayout<Double>.stride)
+        let byteCount = sampleCount * MemoryLayout<Double>.stride
+        var doubleData = self.bufferPool?.acquire() ?? Data(count: byteCount)
+
+        if doubleData.count != byteCount {
+            doubleData = Data(count: byteCount)
+        }
+
         doubleData.withUnsafeMutableBytes { doublePtr in
             let doubles = doublePtr.bindMemory(to: Double.self)
             for i in 0..<sampleCount {
@@ -110,8 +159,14 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             }
         }
 
-        self._binaryMessenger?.send(
-            onChannel: Channels.inputChannelName.rawValue, message: doubleData)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self._binaryMessenger?.send(
+                onChannel: Channels.inputChannelName.rawValue, message: doubleData,
+                binaryReply: { [weak self] _ in
+                    self?.bufferPool?.release(doubleData)
+                })
+        }
         return noErr
     }
 
@@ -127,9 +182,18 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                 guard let data = data, let instance = instance else {
                     return
                 }
-                instance.queue.async {
-                    let doubles: [Double] = data.toArray(type: Double.self)
-                    _ = instance.buffer.writeBlock(doubles)
+                autoreleasepool {
+                    instance.queue.sync {
+                        let count = data.count / MemoryLayout<Double>.stride
+                        data.withUnsafeBytes { rawPtr in
+                            let doubles = rawPtr.bindMemory(to: Double.self)
+                            for i in 0..<count {
+                                if !instance.buffer.write(doubles[i]) {
+                                    break
+                                }
+                            }
+                        }
+                    }
                 }
             })
 
@@ -147,26 +211,22 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case Methods.start.rawValue:
-            start()
-            result(nil)
+            start(result: result)
         case Methods.stop.rawValue:
             stop()
             result(nil)
         case Methods.requestFrameDuration.rawValue:
             if let requested = call.arguments as? Double {
                 _frameDuration = requested
-                // Reconfigure audio session with new buffer duration if running
                 if _isRunning {
                     do {
                         try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(
                             _frameDuration)
-                        // Also update the ring buffer size
                         buffer = RingBuffer<Double>(
                             count: max(
                                 _Constants.ringBufferSize,
                                 Int(_frameDuration * _sampleRate * maxFrameJitter)))
                     } catch {
-                        // Silently fail, keep existing configuration
                     }
                 }
             }
@@ -186,34 +246,70 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         buffer.clear()
     }
 
-    public func start() {
+    public func start(result: @escaping FlutterResult) {
+        let permissionStatus = AVAudioSession.sharedInstance().recordPermission
+
+        switch permissionStatus {
+        case .denied:
+            result(FlutterError(
+                code: AudioIoError.permissionDeniedCode,
+                message: AudioIoError.permissionDeniedMessage,
+                details: nil))
+            return
+        case .undetermined:
+            result(FlutterError(
+                code: AudioIoError.permissionDeniedCode,
+                message: AudioIoError.permissionDeniedMessage,
+                details: nil))
+            return
+        case .granted:
+            break
+        @unknown default:
+            break
+        }
+
         buffer = RingBuffer<Double>(
             count: max(
                 _Constants.ringBufferSize, Int(_frameDuration * _sampleRate * maxFrameJitter)))
-        // Setup AVAudioSession
+
+        let expectedFrameSize = Int(_frameDuration * _sampleRate)
+        let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
+        bufferPool = DataBufferPool(bufferSize: bufferSize, poolSize: 8)
+
         do {
             try AVAudioSession.sharedInstance().setCategory(
                 .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
             try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
             try AVAudioSession.sharedInstance().setPreferredSampleRate(_sampleRate)
         } catch {
+            result(FlutterError(
+                code: AudioIoError.audioSessionCode,
+                message: AudioIoError.audioSessionMessage,
+                details: error.localizedDescription))
             return
         }
 
-        // Connect nodes
         do {
             try setupPipelineIfNeeded()
         } catch {
+            result(FlutterError(
+                code: AudioIoError.engineStartCode,
+                message: AudioIoError.engineStartMessage,
+                details: error.localizedDescription))
             return
         }
 
         inputConverter.outputVolume = 1.0
 
-        // Start engine
         do {
             try engine.start()
             _isRunning = true
+            result(nil)
         } catch {
+            result(FlutterError(
+                code: AudioIoError.engineStartCode,
+                message: AudioIoError.engineStartMessage,
+                details: error.localizedDescription))
         }
     }
 
