@@ -253,6 +253,18 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             break
         }
 
+        do {
+            try startInternal()
+            result(nil)
+        } catch let error as NSError {
+            result(FlutterError(
+                code: error.domain,
+                message: error.localizedDescription,
+                details: nil))
+        }
+    }
+
+    private func startInternal() throws {
         buffer = RingBuffer<Double>(
             count: max(
                 _Constants.ringBufferSize, Int(_frameDuration * _sampleRate * maxFrameJitter)))
@@ -261,28 +273,12 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
         bufferPool = DataBufferPool(bufferSize: bufferSize, poolSize: 8)
 
-        do {
-            try setupPipelineIfNeeded()
-        } catch {
-            result(FlutterError(
-                code: AudioIoError.engineStartCode,
-                message: AudioIoError.engineStartMessage,
-                details: error.localizedDescription))
-            return
-        }
+        try setupPipelineIfNeeded()
 
         inputConverter.outputVolume = 1.0
 
-        do {
-            try engine.start()
-            _isRunning = true
-            result(nil)
-        } catch {
-            result(FlutterError(
-                code: AudioIoError.engineStartCode,
-                message: AudioIoError.engineStartMessage,
-                details: error.localizedDescription))
-        }
+        try engine.start()
+        _isRunning = true
     }
 
     public func setupPipelineIfNeeded() throws {
@@ -327,7 +323,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             engine.stop()
             detachPipeline()
             DispatchQueue.main.async {
-                self.start()
+                try? self.startInternal()
                 self._resetting = false
             }
         }

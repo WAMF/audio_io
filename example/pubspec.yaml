@@ -10,7 +10,8 @@ dependencies:
     sdk: flutter
   permission_handler: ^11.3.1
 
-  audio_io: any
+  audio_io:
+    path: ../
 
 dev_dependencies:
   flutter_test:

@@ -268,6 +268,18 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             break
         }
 
+        do {
+            try startInternal()
+            result(nil)
+        } catch let error as NSError {
+            result(FlutterError(
+                code: error.domain,
+                message: error.localizedDescription,
+                details: nil))
+        }
+    }
+
+    private func startInternal() throws {
         buffer = RingBuffer<Double>(
             count: max(
                 _Constants.ringBufferSize, Int(_frameDuration * _sampleRate * maxFrameJitter)))
@@ -276,41 +288,17 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
         bufferPool = DataBufferPool(bufferSize: bufferSize, poolSize: 8)
 
-        do {
-            try AVAudioSession.sharedInstance().setCategory(
-                .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
-            try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
-            try AVAudioSession.sharedInstance().setPreferredSampleRate(_sampleRate)
-        } catch {
-            result(FlutterError(
-                code: AudioIoError.audioSessionCode,
-                message: AudioIoError.audioSessionMessage,
-                details: error.localizedDescription))
-            return
-        }
+        try AVAudioSession.sharedInstance().setCategory(
+            .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
+        try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
+        try AVAudioSession.sharedInstance().setPreferredSampleRate(_sampleRate)
 
-        do {
-            try setupPipelineIfNeeded()
-        } catch {
-            result(FlutterError(
-                code: AudioIoError.engineStartCode,
-                message: AudioIoError.engineStartMessage,
-                details: error.localizedDescription))
-            return
-        }
+        try setupPipelineIfNeeded()
 
         inputConverter.outputVolume = 1.0
 
-        do {
-            try engine.start()
-            _isRunning = true
-            result(nil)
-        } catch {
-            result(FlutterError(
-                code: AudioIoError.engineStartCode,
-                message: AudioIoError.engineStartMessage,
-                details: error.localizedDescription))
-        }
+        try engine.start()
+        _isRunning = true
     }
 
     public func setupPipelineIfNeeded() throws {
@@ -393,7 +381,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             engine.stop()
             detachPipeline()
             DispatchQueue.main.async {
-                self.start()
+                try? self.startInternal()
                 self._resetting = false
             }
         }

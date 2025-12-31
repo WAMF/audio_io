@@ -113,6 +113,10 @@ Platform Support:
 - Linux ✅ (FFI/miniaudio)
 - Windows ✅ (FFI/miniaudio)
 
+## 0.3.2
+Bug Fix
+- Fixed compile error in resetAudio() caused by start() signature change
+
 ## 0.3.1
 Performance, Stability & Error Handling Update
 

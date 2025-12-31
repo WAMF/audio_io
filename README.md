@@ -32,7 +32,7 @@ Add `audio_io` to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  audio_io: ^0.3.1
+  audio_io: ^0.3.2
 ```
 
 ### iOS Setup
