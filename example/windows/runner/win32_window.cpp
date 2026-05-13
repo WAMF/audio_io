@@ -150,7 +150,8 @@ bool Win32Window::Create(const std::wstring& title,
 }
 
 bool Win32Window::Show() {
-  return ShowWindow(window_handle_, SW_SHOWNORMAL);
+  ShowWindow(window_handle_, SW_SHOWNORMAL);
+  return true;
 }
 
 // static
@@ -222,6 +223,10 @@ Win32Window::MessageHandler(HWND hwnd,
 }
 
 void Win32Window::Destroy() {
+  if (destroyed_) {
+    return;
+  }
+  destroyed_ = true;
   OnDestroy();
 
   if (window_handle_) {
