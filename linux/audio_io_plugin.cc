@@ -23,6 +23,7 @@ static void audio_io_plugin_handle_method_call(
   g_autoptr(FlMethodResponse) response = nullptr;
 
   const gchar* method = fl_method_call_get_name(method_call);
+  (void)method;
 
   // This plugin uses FFI, so method calls are not expected
   response = FL_METHOD_RESPONSE(fl_method_not_implemented_response_new());
