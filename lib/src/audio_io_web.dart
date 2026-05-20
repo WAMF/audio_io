@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
+import 'dart:typed_data';
+
 import 'package:web/web.dart' as web;
 
 import 'audio_io_stub.dart';
@@ -84,7 +86,13 @@ class AudioIoWeb implements AudioIoImpl {
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
 
   @override
-  Future<void> start() async {
+  Stream<Uint8List>? get inputBytesStream => null;
+
+  @override
+  StreamSink<Uint8List>? get outputBytesSink => null;
+
+  @override
+  Future<void> start({int sampleRate = 48000, int format = 0}) async {
     if (_isRunning) return;
 
     try {

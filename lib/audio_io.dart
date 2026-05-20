@@ -1,8 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-// Conditional imports for platform-specific implementations
 import 'src/audio_io_stub.dart'
     if (dart.library.io) 'src/audio_io_native.dart'
     if (dart.library.js_interop) 'src/audio_io_web.dart' as impl;
@@ -26,6 +27,37 @@ class _Constants {
   static const millisecPerSec = 1000;
 }
 
+/// Audio format for streaming data.
+enum AudioIoFormat {
+  /// Float64 samples in [-1.0, 1.0]. Default, backward compatible.
+  float64(0),
+
+  /// Signed 16-bit PCM little-endian. For real-time AI APIs.
+  pcm16(1);
+
+  const AudioIoFormat(this.value);
+
+  /// Native format identifier.
+  final int value;
+}
+
+/// Supported sample rates.
+enum AudioIoSampleRate {
+  /// 16 kHz — speech AI APIs (Gemini Live, Whisper).
+  rate16000(16000),
+
+  /// 24 kHz — OpenAI Realtime API.
+  rate24000(24000),
+
+  /// 48 kHz — full quality, default.
+  rate48000(48000);
+
+  const AudioIoSampleRate(this.hz);
+
+  /// Sample rate in Hz.
+  final int hz;
+}
+
 enum AudioIoLatency {
   Realtime,
   Balanced,
@@ -45,6 +77,30 @@ enum AudioIoQuality {
   Highest,
 }
 
+/// Configuration for [AudioIo.startWith].
+class AudioIoConfig {
+  /// Target sample rate.
+  final AudioIoSampleRate sampleRate;
+
+  /// Audio data format.
+  final AudioIoFormat format;
+
+  /// Latency preset.
+  final AudioIoLatency latency;
+
+  /// Frame chunk duration in milliseconds. Null uses the platform default.
+  /// When set, input stream emits chunks of approximately this duration.
+  /// Valid range: 20–100 ms.
+  final int? frameDurationMs;
+
+  const AudioIoConfig({
+    this.sampleRate = AudioIoSampleRate.rate48000,
+    this.format = AudioIoFormat.float64,
+    this.latency = AudioIoLatency.Balanced,
+    this.frameDurationMs,
+  });
+}
+
 class AudioIo {
   MethodChannel _methods = const MethodChannel(_Channels.methodChannelName);
   StreamSubscription<List<double>>? _outputSubscription;
@@ -52,7 +108,6 @@ class AudioIo {
   AudioIoLatency frameSize = AudioIoLatency.Balanced;
   static AudioIo instance = AudioIo();
 
-  // Platform-specific implementation
   final _impl = impl.createAudioIoImpl();
 
   StreamController<List<double>> _outputController =
@@ -60,6 +115,12 @@ class AudioIo {
   StreamController<List<double>> _inputController =
       StreamController<List<double>>.broadcast();
 
+  AudioIoConfig? _config;
+
+  /// Current configuration. Null before [startWith] is called.
+  AudioIoConfig? get currentConfig => _config;
+
+  /// Float64 input stream. Active when format is [AudioIoFormat.float64].
   Stream<List<double>> get input {
     if (_impl.usePlatformImpl) {
       return _impl.inputAudioStream ?? const Stream.empty();
@@ -67,6 +128,7 @@ class AudioIo {
     return _inputController.stream;
   }
 
+  /// Float64 output sink. Active when format is [AudioIoFormat.float64].
   Sink<List<double>> get output {
     if (_impl.usePlatformImpl) {
       return _impl.outputAudioStream ?? StreamController<List<double>>().sink;
@@ -74,13 +136,31 @@ class AudioIo {
     return _outputController.sink;
   }
 
+  /// PCM16 input stream. Active when format is [AudioIoFormat.pcm16].
+  /// Each [Uint8List] contains signed 16-bit little-endian PCM samples.
+  Stream<Uint8List> get inputBytes {
+    if (_impl.usePlatformImpl) {
+      return _impl.inputBytesStream ?? const Stream.empty();
+    }
+    return const Stream.empty();
+  }
+
+  /// PCM16 output sink. Active when format is [AudioIoFormat.pcm16].
+  /// Write signed 16-bit little-endian PCM bytes.
+  Sink<Uint8List> get outputBytes {
+    if (_impl.usePlatformImpl) {
+      return _impl.outputBytesSink ?? StreamController<Uint8List>().sink;
+    }
+    return StreamController<Uint8List>().sink;
+  }
+
+  /// Start with default settings (48 kHz, Float64, Balanced latency).
   Future<void> start() async {
     if (_impl.usePlatformImpl) {
       await _impl.start();
       return;
     }
 
-    // Original method channel implementation for iOS/macOS
     _outputSubscription?.cancel();
     _inputSubscription?.cancel();
     _outputSubscription = _outputController.stream.listen((output) {
@@ -100,6 +180,70 @@ class AudioIo {
       },
     );
     return _methods.invokeMethod(_Methods.start);
+  }
+
+  /// Start with explicit configuration.
+  Future<void> startWith(AudioIoConfig config) async {
+    _config = config;
+
+    if (_impl.usePlatformImpl) {
+      if (config.frameDurationMs != null) {
+        await _impl.requestFrameDuration(config.frameDurationMs! / 1000.0);
+      } else {
+        await _impl.requestFrameDuration(_presetLatency[config.latency]!);
+      }
+      await _impl.start(
+        sampleRate: config.sampleRate.hz,
+        format: config.format.value,
+      );
+      return;
+    }
+
+    // iOS/macOS method channel path
+    final frameDuration = config.frameDurationMs != null
+        ? config.frameDurationMs! / 1000.0
+        : _presetLatency[config.latency]!;
+    await _methods.invokeMethod(_Methods.requestFrameDuration, frameDuration);
+
+    _outputSubscription?.cancel();
+    _inputSubscription?.cancel();
+
+    if (config.format == AudioIoFormat.pcm16) {
+      // PCM16 over method channel — native side sends Int16 LE bytes
+      ServicesBinding.instance.defaultBinaryMessenger.setMessageHandler(
+        _Channels.audioInput,
+        (ByteData? message) {
+          if (message != null) {
+            // PCM16 via method channel not yet implemented for iOS/macOS
+            // Will be added in Phase 4
+          }
+          return null;
+        },
+      );
+    } else {
+      _outputSubscription = _outputController.stream.listen((output) {
+        final outData = ByteData.view(Float64List.fromList(output).buffer);
+        ServicesBinding.instance.defaultBinaryMessenger
+            .send(_Channels.audioOutput, outData);
+      });
+      ServicesBinding.instance.defaultBinaryMessenger.setMessageHandler(
+        _Channels.audioInput,
+        (ByteData? message) {
+          if (message != null) {
+            final audioFrame = message.buffer.asFloat64List(
+                message.offsetInBytes,
+                message.lengthInBytes ~/ _Constants.bytesPerSample);
+            _inputController.sink.add(audioFrame);
+          }
+          return null;
+        },
+      );
+    }
+
+    return _methods.invokeMethod(_Methods.start, {
+      'sampleRate': config.sampleRate.hz,
+      'format': config.format.value,
+    });
   }
 
   Future<void> stop() async {

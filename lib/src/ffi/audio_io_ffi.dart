@@ -1,9 +1,13 @@
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
 import 'audio_io_bindings.dart';
+
+const int _formatFloat64 = 0;
+const int _formatPcm16 = 1;
 
 class AudioIoFFI {
   static AudioIoFFI? _instance;
@@ -14,11 +18,15 @@ class AudioIoFFI {
 
   StreamController<List<double>>? _inputController;
   StreamController<List<double>>? _outputController;
+  StreamController<Uint8List>? _inputBytesController;
+  StreamController<Uint8List>? _outputBytesController;
 
   Timer? _inputTimer;
 
   bool _isRunning = false;
-  double _requestedFrameDuration = 0.003; // Default to Balanced (3ms)
+  double _requestedFrameDuration = 0.003;
+  int _requestedSampleRate = 48000;
+  int _requestedFormat = _formatFloat64;
 
   AudioIoFFI._() {
     _bindings = AudioIoBindings();
@@ -26,17 +34,25 @@ class AudioIoFFI {
 
   Stream<List<double>>? get inputAudioStream => _inputController?.stream;
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
+  Stream<Uint8List>? get inputBytesStream => _inputBytesController?.stream;
+  StreamSink<Uint8List>? get outputBytesSink => _outputBytesController?.sink;
 
-  Future<void> start() async {
+  bool get isPcm16 => _requestedFormat == _formatPcm16;
+
+  Future<void> start({int sampleRate = 48000, int format = 0}) async {
     if (_isRunning) return;
 
-    _handle = _bindings.create();
+    _requestedSampleRate = sampleRate;
+    _requestedFormat = format;
+
+    _handle = _bindings.createWithConfig(
+      _requestedFrameDuration,
+      sampleRate,
+      format,
+    );
     if (_handle == nullptr) {
       throw Exception('Failed to create audio context');
     }
-
-    // Set the frame duration before starting
-    _bindings.setFrameDuration(_handle!, _requestedFrameDuration);
 
     final result = _bindings.start(_handle!);
     if (result != 0) {
@@ -47,12 +63,15 @@ class AudioIoFFI {
 
     _isRunning = true;
 
-    _inputController = StreamController<List<double>>.broadcast();
-    _outputController = StreamController<List<double>>();
-
-    _outputController!.stream.listen((data) {
-      _writeAudio(data);
-    });
+    if (format == _formatPcm16) {
+      _inputBytesController = StreamController<Uint8List>.broadcast();
+      _outputBytesController = StreamController<Uint8List>();
+      _outputBytesController!.stream.listen(_writePcm16Audio);
+    } else {
+      _inputController = StreamController<List<double>>.broadcast();
+      _outputController = StreamController<List<double>>();
+      _outputController!.stream.listen(_writeAudio);
+    }
 
     _startInputPolling();
   }
@@ -67,8 +86,12 @@ class AudioIoFFI {
 
     await _inputController?.close();
     await _outputController?.close();
+    await _inputBytesController?.close();
+    await _outputBytesController?.close();
     _inputController = null;
     _outputController = null;
+    _inputBytesController = null;
+    _outputBytesController = null;
 
     if (_handle != null) {
       _bindings.stop(_handle!);
@@ -79,31 +102,58 @@ class AudioIoFFI {
 
   void _startInputPolling() {
     const pollInterval = Duration(milliseconds: 10);
-    const framesPerPoll = 480;
+    final framesPerPoll = (_requestedSampleRate * 0.01).toInt();
 
     _inputTimer = Timer.periodic(pollInterval, (_) {
       if (!_isRunning || _handle == null) return;
 
       final availableFrames = _bindings.getAvailableReadFrames(_handle!);
-      if (availableFrames > 0) {
-        final framesToRead =
-            availableFrames > framesPerPoll ? framesPerPoll : availableFrames;
-        final buffer = malloc<Double>(framesToRead);
+      if (availableFrames <= 0) return;
 
-        try {
-          final framesRead = _bindings.read(_handle!, buffer, framesToRead);
-          if (framesRead > 0) {
-            final data = List<double>.generate(
-              framesRead,
-              (i) => buffer[i],
-            );
-            _inputController?.add(data);
-          }
-        } finally {
-          malloc.free(buffer);
-        }
+      final framesToRead =
+          availableFrames > framesPerPoll ? framesPerPoll : availableFrames;
+
+      if (isPcm16) {
+        _pollPcm16Input(framesToRead);
+      } else {
+        _pollFloat64Input(framesToRead);
       }
     });
+  }
+
+  void _pollFloat64Input(int framesToRead) {
+    final buffer = malloc<Double>(framesToRead);
+    try {
+      final framesRead = _bindings.read(_handle!, buffer, framesToRead);
+      if (framesRead > 0) {
+        final data = List<double>.generate(
+          framesRead,
+          (i) => buffer[i],
+        );
+        _inputController?.add(data);
+      }
+    } finally {
+      malloc.free(buffer);
+    }
+  }
+
+  void _pollPcm16Input(int framesToRead) {
+    final buffer = malloc<Int16>(framesToRead);
+    try {
+      final framesRead = _bindings.readPcm16(_handle!, buffer, framesToRead);
+      if (framesRead > 0) {
+        final int16List = buffer.asTypedList(framesRead);
+        final bytes = Uint8List.fromList(
+          int16List.buffer.asUint8List(
+            int16List.offsetInBytes,
+            framesRead * 2,
+          ),
+        );
+        _inputBytesController?.add(bytes);
+      }
+    } finally {
+      malloc.free(buffer);
+    }
   }
 
   void _writeAudio(List<double> data) {
@@ -114,40 +164,46 @@ class AudioIoFFI {
       for (int i = 0; i < data.length; i++) {
         buffer[i] = data[i];
       }
-
       _bindings.write(_handle!, buffer, data.length);
     } finally {
       malloc.free(buffer);
     }
   }
 
-  Map<String, dynamic> getFormat() {
-    if (_handle == null) {
-      return {
-        'input': {
-          'type': 'double',
-          'channels': 1,
-          'sampleRate': 48000.0,
-        },
-        'output': {
-          'type': 'double',
-          'channels': 1,
-          'sampleRate': 48000.0,
-        },
-      };
-    }
+  void _writePcm16Audio(Uint8List data) {
+    if (!_isRunning || _handle == null) return;
 
-    final sampleRate = _bindings.getSampleRate(_handle!).toDouble();
-    final channels = _bindings.getChannels(_handle!);
+    final frameCount = data.length ~/ 2;
+    if (frameCount <= 0) return;
+
+    final buffer = malloc<Int16>(frameCount);
+    try {
+      final int16View = data.buffer.asInt16List(data.offsetInBytes, frameCount);
+      for (int i = 0; i < frameCount; i++) {
+        buffer[i] = int16View[i];
+      }
+      _bindings.writePcm16(_handle!, buffer, frameCount);
+    } finally {
+      malloc.free(buffer);
+    }
+  }
+
+  Map<String, dynamic> getFormat() {
+    final sampleRate = _handle != null
+        ? _bindings.getSampleRate(_handle!).toDouble()
+        : _requestedSampleRate.toDouble();
+    final channels =
+        _handle != null ? _bindings.getChannels(_handle!) : 1;
+    final type = isPcm16 ? 'pcm16' : 'double';
 
     return {
       'input': {
-        'type': 'double',
+        'type': type,
         'channels': channels,
         'sampleRate': sampleRate,
       },
       'output': {
-        'type': 'double',
+        'type': type,
         'channels': channels,
         'sampleRate': sampleRate,
       },

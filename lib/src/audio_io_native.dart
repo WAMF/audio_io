@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'audio_io_stub.dart';
 import 'ffi/audio_io_ffi.dart';
@@ -18,9 +19,15 @@ class AudioIoNative implements AudioIoImpl {
   StreamSink<List<double>>? get outputAudioStream => _ffi?.outputAudioStream;
 
   @override
-  Future<void> start() async {
+  Stream<Uint8List>? get inputBytesStream => _ffi?.inputBytesStream;
+
+  @override
+  StreamSink<Uint8List>? get outputBytesSink => _ffi?.outputBytesSink;
+
+  @override
+  Future<void> start({int sampleRate = 48000, int format = 0}) async {
     _ffi = AudioIoFFI.instance;
-    await _ffi!.start();
+    await _ffi!.start(sampleRate: sampleRate, format: format);
   }
 
   @override
