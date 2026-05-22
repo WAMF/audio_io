@@ -172,6 +172,7 @@ class AudioIo {
 
     _outputSubscription?.cancel();
     _inputSubscription?.cancel();
+    _outputBytesSubscription?.cancel();
     _outputSubscription = _outputController.stream.listen((output) {
       final outData = ByteData.view(Float64List.fromList(output).buffer);
       ServicesBinding.instance.defaultBinaryMessenger
@@ -269,6 +270,9 @@ class AudioIo {
       await _impl.stop();
       return;
     }
+    await _outputSubscription?.cancel();
+    await _inputSubscription?.cancel();
+    await _outputBytesSubscription?.cancel();
     await _methods.invokeMethod(_Methods.stop);
   }
 
@@ -307,9 +311,14 @@ class AudioIo {
       _impl.stop();
       return;
     }
+    unawaited(_outputSubscription?.cancel());
+    unawaited(_inputSubscription?.cancel());
+    unawaited(_outputBytesSubscription?.cancel());
     _outputController.sink.close();
     _outputController.close();
     _inputController.sink.close();
     _inputController.close();
+    _inputBytesController.close();
+    _outputBytesController.close();
   }
 }

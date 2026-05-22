@@ -120,13 +120,22 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
 
   void _listenToWebSocket() {
     _wsSubscription = _channel?.stream.listen(
-      (message) {
+      (message) async {
         if (message is! String) return;
         final decoded = jsonDecode(message);
         if (decoded is! Map<String, dynamic>) return;
 
         if (decoded.containsKey('setupComplete')) {
-          _onSetupComplete();
+          try {
+            await _onSetupComplete();
+          } on Exception catch (e) {
+            if (!mounted) return;
+            setState(() {
+              _state = _ConnectionState.error;
+              _statusMessage = 'Audio start failed: $e';
+            });
+            await _disconnect();
+          }
           return;
         }
 
