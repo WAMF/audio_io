@@ -270,6 +270,8 @@ class AudioIo {
       await _impl.stop();
       return;
     }
+    ServicesBinding.instance.defaultBinaryMessenger
+        .setMessageHandler(_Channels.audioInput, null);
     await _outputSubscription?.cancel();
     await _inputSubscription?.cancel();
     await _outputBytesSubscription?.cancel();
@@ -311,6 +313,8 @@ class AudioIo {
       _impl.stop();
       return;
     }
+    ServicesBinding.instance.defaultBinaryMessenger
+        .setMessageHandler(_Channels.audioInput, null);
     unawaited(_outputSubscription?.cancel());
     unawaited(_inputSubscription?.cancel());
     unawaited(_outputBytesSubscription?.cancel());
