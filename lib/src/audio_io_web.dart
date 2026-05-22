@@ -69,12 +69,18 @@ extension AudioBufferExt on AudioBuffer {
 }
 
 class AudioIoWeb implements AudioIoImpl {
+  static const _pcm16FormatValue = 1;
+  static const _scriptProcessorBufferSize = 2048;
+
   AudioContext? _audioContext;
   ScriptProcessorNode? _scriptProcessor;
   StreamController<List<double>>? _inputController;
   StreamController<List<double>>? _outputController;
+  StreamController<Uint8List>? _inputBytesController;
+  StreamController<Uint8List>? _outputBytesController;
   List<double> _outputBuffer = [];
   bool _isRunning = false;
+  int _format = 0;
 
   @override
   bool get usePlatformImpl => true;
@@ -86,37 +92,44 @@ class AudioIoWeb implements AudioIoImpl {
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
 
   @override
-  Stream<Uint8List>? get inputBytesStream => null;
+  Stream<Uint8List>? get inputBytesStream => _inputBytesController?.stream;
 
   @override
-  StreamSink<Uint8List>? get outputBytesSink => null;
+  StreamSink<Uint8List>? get outputBytesSink => _outputBytesController?.sink;
 
   @override
   Future<void> start({int sampleRate = 48000, int format = 0}) async {
     if (_isRunning) return;
+    _format = format;
 
     try {
-      // Create audio context
       _audioContext = AudioContext();
 
-      // Resume context if suspended (required for Chrome)
       if (_audioContext!.state == 'suspended') {
         await _audioContext!.resume().toDart;
       }
 
-      // Create script processor for audio processing
-      // Buffer size of 2048, 1 input channel, 1 output channel
-      _scriptProcessor = _audioContext!.createScriptProcessor(2048, 1, 1);
+      _scriptProcessor = _audioContext!.createScriptProcessor(
+        _scriptProcessorBufferSize,
+        1,
+        1,
+      );
 
       _inputController = StreamController<List<double>>.broadcast();
       _outputController = StreamController<List<double>>();
+      _inputBytesController = StreamController<Uint8List>.broadcast();
+      _outputBytesController = StreamController<Uint8List>();
 
-      // Listen for output data
-      _outputController!.stream.listen((data) {
-        _outputBuffer.addAll(data);
-      });
+      if (_format == _pcm16FormatValue) {
+        _outputBytesController!.stream.listen((bytes) {
+          _outputBuffer.addAll(_pcm16LeToFloat32(bytes));
+        });
+      } else {
+        _outputController!.stream.listen((data) {
+          _outputBuffer.addAll(data);
+        });
+      }
 
-      // Set up audio processing callback
       _scriptProcessor!.onaudioprocess = ((JSAny event) {
         final audioEvent = event as AudioProcessingEvent;
         final inputBuffer = audioEvent.inputBuffer;
@@ -124,23 +137,20 @@ class AudioIoWeb implements AudioIoImpl {
 
         final bufferLength = inputBuffer.length;
 
-        // Get input data
         final inputData = inputBuffer.getChannelData(0);
-
-        // Convert Float32Array to Dart List
         final inputList = <double>[];
         for (int i = 0; i < bufferLength; i++) {
           final value = inputData.getProperty(i.toJS) as JSNumber?;
           inputList.add(value?.toDartDouble ?? 0.0);
         }
 
-        // Send input to stream
-        _inputController?.add(inputList);
+        if (_format == _pcm16FormatValue) {
+          _inputBytesController?.add(_float32ListToPcm16Le(inputList));
+        } else {
+          _inputController?.add(inputList);
+        }
 
-        // Get output data
         final outputData = outputBuffer.getChannelData(0);
-
-        // Fill output buffer
         for (int i = 0; i < bufferLength; i++) {
           final value =
               _outputBuffer.isNotEmpty ? _outputBuffer.removeAt(0) : 0.0;
@@ -148,10 +158,8 @@ class AudioIoWeb implements AudioIoImpl {
         }
       }).toJS;
 
-      // Connect to speakers
       _scriptProcessor!.connect(_audioContext!.destination);
 
-      // Request microphone access
       final mediaStream = await _getUserMedia();
       if (mediaStream != null) {
         final source = _audioContext!.createMediaStreamSource(mediaStream);
@@ -194,8 +202,12 @@ class AudioIoWeb implements AudioIoImpl {
 
     await _inputController?.close();
     await _outputController?.close();
+    await _inputBytesController?.close();
+    await _outputBytesController?.close();
     _inputController = null;
     _outputController = null;
+    _inputBytesController = null;
+    _outputBytesController = null;
     _outputBuffer.clear();
   }
 
@@ -228,6 +240,24 @@ class AudioIoWeb implements AudioIoImpl {
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
     return 2048 / sampleRate;
   }
+}
+
+Uint8List _float32ListToPcm16Le(List<double> samples) {
+  final bytes = ByteData(samples.length * 2);
+  for (var i = 0; i < samples.length; i++) {
+    final clamped = samples[i].clamp(-1.0, 1.0);
+    bytes.setInt16(i * 2, (clamped * 32767).round(), Endian.little);
+  }
+  return bytes.buffer.asUint8List();
+}
+
+List<double> _pcm16LeToFloat32(Uint8List bytes) {
+  final data = ByteData.sublistView(bytes);
+  final samples = List<double>.filled(bytes.length ~/ 2, 0.0);
+  for (var i = 0; i < samples.length; i++) {
+    samples[i] = data.getInt16(i * 2, Endian.little) / 32767.0;
+  }
+  return samples;
 }
 
 AudioIoImpl createAudioIoImpl() => AudioIoWeb();
