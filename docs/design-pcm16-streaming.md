@@ -81,7 +81,7 @@ When `format: pcm16`, `inputBytes` emits data and `input` is silent (and vice ve
 
 ### Input (Recording)
 
-```
+```text
 Mic → Hardware ADC → [Native Resample to target rate] → [Native Convert to target format] → Binary Channel → Dart Stream
 ```
 
@@ -90,7 +90,7 @@ Mic → Hardware ADC → [Native Resample to target rate] → [Native Convert to
 
 ### Output (Playback)
 
-```
+```text
 Dart Sink → Binary Channel → [Native Convert from target format] → [Native Resample to hardware rate] → DAC → Speakers
 ```
 

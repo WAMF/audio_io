@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
@@ -78,7 +79,7 @@ class AudioIoWeb implements AudioIoImpl {
   StreamController<List<double>>? _outputController;
   StreamController<Uint8List>? _inputBytesController;
   StreamController<Uint8List>? _outputBytesController;
-  List<double> _outputBuffer = [];
+  final Queue<double> _outputBuffer = Queue<double>();
   bool _isRunning = false;
   int _format = 0;
 
@@ -104,6 +105,11 @@ class AudioIoWeb implements AudioIoImpl {
 
     try {
       _audioContext = AudioContext();
+      final actualRate = _audioContext!.sampleRate.toInt();
+      if (sampleRate != actualRate) {
+        print('Warning: Web AudioContext runs at ${actualRate}Hz, '
+            'requested ${sampleRate}Hz. Audio will use ${actualRate}Hz.');
+      }
 
       if (_audioContext!.state == 'suspended') {
         await _audioContext!.resume().toDart;
@@ -153,7 +159,7 @@ class AudioIoWeb implements AudioIoImpl {
         final outputData = outputBuffer.getChannelData(0);
         for (int i = 0; i < bufferLength; i++) {
           final value =
-              _outputBuffer.isNotEmpty ? _outputBuffer.removeAt(0) : 0.0;
+              _outputBuffer.isNotEmpty ? _outputBuffer.removeFirst() : 0.0;
           outputData.setProperty(i.toJS, value.toJS);
         }
       }).toJS;

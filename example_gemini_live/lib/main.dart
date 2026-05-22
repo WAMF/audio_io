@@ -65,7 +65,7 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   @override
   void dispose() {
     _apiKeyController.dispose();
-    _disconnect();
+    unawaited(_disconnect());
     super.dispose();
   }
 
@@ -121,16 +121,19 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   void _listenToWebSocket() {
     _wsSubscription = _channel?.stream.listen(
       (message) {
-        final json = jsonDecode(message as String) as Map<String, dynamic>;
+        if (message is! String) return;
+        final decoded = jsonDecode(message);
+        if (decoded is! Map<String, dynamic>) return;
 
-        if (json.containsKey('setupComplete')) {
+        if (decoded.containsKey('setupComplete')) {
           _onSetupComplete();
           return;
         }
 
-        _handleServerContent(json);
+        _handleServerContent(decoded);
       },
       onError: (Object error) {
+        if (!mounted) return;
         setState(() {
           _state = _ConnectionState.error;
           _statusMessage = 'WebSocket error: $error';
@@ -138,6 +141,7 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
         _stopAudio();
       },
       onDone: () {
+        if (!mounted) return;
         setState(() {
           _state = _ConnectionState.disconnected;
           _statusMessage = 'Disconnected';
@@ -192,8 +196,8 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
     if (parts == null) return;
 
     for (final part in parts) {
-      final partMap = part as Map<String, dynamic>;
-      final inlineData = partMap['inlineData'] as Map<String, dynamic>?;
+      if (part is! Map<String, dynamic>) continue;
+      final inlineData = part['inlineData'] as Map<String, dynamic>?;
       if (inlineData == null) continue;
 
       final mimeType = inlineData['mimeType'] as String?;

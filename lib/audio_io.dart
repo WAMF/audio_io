@@ -98,7 +98,11 @@ class AudioIoConfig {
     this.format = AudioIoFormat.float64,
     this.latency = AudioIoLatency.Balanced,
     this.frameDurationMs,
-  });
+  }) : assert(
+          frameDurationMs == null ||
+              (frameDurationMs >= 20 && frameDurationMs <= 100),
+          'frameDurationMs must be between 20 and 100 milliseconds',
+        );
 }
 
 class AudioIo {
@@ -114,6 +118,11 @@ class AudioIo {
       StreamController<List<double>>.broadcast();
   StreamController<List<double>> _inputController =
       StreamController<List<double>>.broadcast();
+  final StreamController<Uint8List> _inputBytesController =
+      StreamController<Uint8List>.broadcast();
+  final StreamController<Uint8List> _outputBytesController =
+      StreamController<Uint8List>.broadcast();
+  StreamSubscription<Uint8List>? _outputBytesSubscription;
 
   AudioIoConfig? _config;
 
@@ -142,7 +151,7 @@ class AudioIo {
     if (_impl.usePlatformImpl) {
       return _impl.inputBytesStream ?? const Stream.empty();
     }
-    return const Stream.empty();
+    return _inputBytesController.stream;
   }
 
   /// PCM16 output sink. Active when format is [AudioIoFormat.pcm16].
@@ -151,7 +160,7 @@ class AudioIo {
     if (_impl.usePlatformImpl) {
       return _impl.outputBytesSink ?? StreamController<Uint8List>().sink;
     }
-    return StreamController<Uint8List>().sink;
+    return _outputBytesController.sink;
   }
 
   /// Start with default settings (48 kHz, Float64, Balanced latency).
@@ -207,15 +216,24 @@ class AudioIo {
 
     _outputSubscription?.cancel();
     _inputSubscription?.cancel();
+    _outputBytesSubscription?.cancel();
 
     if (config.format == AudioIoFormat.pcm16) {
-      // PCM16 over method channel — native side sends Int16 LE bytes
+      _outputBytesSubscription =
+          _outputBytesController.stream.listen((bytes) {
+        final data = ByteData.sublistView(bytes);
+        ServicesBinding.instance.defaultBinaryMessenger
+            .send(_Channels.audioOutput, data);
+      });
       ServicesBinding.instance.defaultBinaryMessenger.setMessageHandler(
         _Channels.audioInput,
         (ByteData? message) {
           if (message != null) {
-            // PCM16 via method channel not yet implemented for iOS/macOS
-            // Will be added in Phase 4
+            final bytes = message.buffer.asUint8List(
+              message.offsetInBytes,
+              message.lengthInBytes,
+            );
+            _inputBytesController.sink.add(bytes);
           }
           return null;
         },
