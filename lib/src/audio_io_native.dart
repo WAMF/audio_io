@@ -25,7 +25,13 @@ class AudioIoNative implements AudioIoImpl {
   StreamSink<Uint8List>? get outputBytesSink => _ffi?.outputBytesSink;
 
   @override
-  Future<void> start({int sampleRate = 48000, int format = 0}) async {
+  Future<void> start({
+    int sampleRate = 48000,
+    int format = 0,
+    // Native backends negotiate [sampleRate] with the device, so the
+    // web-only mismatch flag does not apply here.
+    bool allowSampleRateMismatch = false,
+  }) async {
     _ffi = AudioIoFFI.instance;
     await _ffi!.start(sampleRate: sampleRate, format: format);
   }

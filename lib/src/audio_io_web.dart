@@ -2,8 +2,8 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:web/web.dart' as web;
 
 import 'audio_io_stub.dart';
@@ -82,6 +82,7 @@ class AudioIoWeb implements AudioIoImpl {
   final Queue<double> _outputBuffer = Queue<double>();
   bool _isRunning = false;
   int _format = 0;
+  int _requestedSampleRate = 48000;
 
   @override
   bool get usePlatformImpl => true;
@@ -99,15 +100,48 @@ class AudioIoWeb implements AudioIoImpl {
   StreamSink<Uint8List>? get outputBytesSink => _outputBytesController?.sink;
 
   @override
-  Future<void> start({int sampleRate = 48000, int format = 0}) async {
-    if (_isRunning) return;
+  Future<void> start({
+    int sampleRate = 48000,
+    int format = 0,
+    bool allowSampleRateMismatch = false,
+  }) async {
+    if (_isRunning) {
+      // A same-config restart is a no-op; a reconfigure (different rate or
+      // format) while running would silently keep the first config, so
+      // surface it instead of swallowing it.
+      if (sampleRate != _requestedSampleRate || format != _format) {
+        throw StateError(
+          'audio_io is already started; call stop() before reconfiguring '
+          '(requested sampleRate=$sampleRate, format=$format; '
+          'current sampleRate=$_requestedSampleRate, format=$_format)',
+        );
+      }
+      return;
+    }
     _format = format;
+    _requestedSampleRate = sampleRate;
 
     try {
       _audioContext = AudioContext();
       final actualRate = _audioContext!.sampleRate.toInt();
       if (sampleRate != actualRate) {
-        print('Warning: Web AudioContext runs at ${actualRate}Hz, '
+        // The browser controls the AudioContext rate; it cannot be forced.
+        // Proceeding silently would emit `actualRate` audio mislabelled as
+        // `sampleRate` (e.g. 48 kHz sent to a 16 kHz Gemini Live endpoint),
+        // producing aliased / wrong-speed audio with no surfaced error.
+        // Fail loudly unless the caller has explicitly opted in.
+        if (!allowSampleRateMismatch) {
+          await _audioContext!.close().toDart;
+          _audioContext = null;
+          throw StateError(
+            'Web AudioContext runs at ${actualRate}Hz but ${sampleRate}Hz '
+            'was requested. The browser controls this rate and it cannot be '
+            'changed. Either request ${actualRate}Hz (see getFormat()), '
+            'resample on your side, or pass '
+            'allowSampleRateMismatch: true to accept ${actualRate}Hz audio.',
+          );
+        }
+        debugPrint('Warning: Web AudioContext runs at ${actualRate}Hz, '
             'requested ${sampleRate}Hz. Audio will use ${actualRate}Hz.');
       }
 
@@ -189,7 +223,7 @@ class AudioIoWeb implements AudioIoImpl {
           .toDart;
       return stream;
     } catch (e) {
-      print('Failed to get user media: $e');
+      debugPrint('Failed to get user media: $e');
       return null;
     }
   }

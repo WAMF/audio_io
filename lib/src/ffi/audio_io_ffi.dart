@@ -40,7 +40,21 @@ class AudioIoFFI {
   bool get isPcm16 => _requestedFormat == _formatPcm16;
 
   Future<void> start({int sampleRate = 48000, int format = 0}) async {
-    if (_isRunning) return;
+    if (_isRunning) {
+      // Re-starting with the same config is a harmless no-op, but silently
+      // ignoring a *reconfigure* (e.g. pcm16 -> float64, or a new sample
+      // rate) would leave the caller listening on the wrong stream with no
+      // signal. Fail loudly instead.
+      if (sampleRate != _requestedSampleRate || format != _requestedFormat) {
+        throw StateError(
+          'audio_io is already started; call stop() before reconfiguring '
+          '(requested sampleRate=$sampleRate, format=$format; '
+          'current sampleRate=$_requestedSampleRate, '
+          'format=$_requestedFormat)',
+        );
+      }
+      return;
+    }
 
     _requestedSampleRate = sampleRate;
     _requestedFormat = format;

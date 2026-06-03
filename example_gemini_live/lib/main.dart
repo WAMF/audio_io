@@ -174,6 +174,10 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
       sampleRate: AudioIoSampleRate.rate16000,
       format: AudioIoFormat.pcm16,
       latency: AudioIoLatency.Realtime,
+      // On web the browser controls the AudioContext rate (typically
+      // 44.1/48 kHz), so 16 kHz can't be guaranteed. Opt in to the actual
+      // rate; on native the device honours 16 kHz and this is ignored.
+      allowSampleRateMismatch: true,
     );
 
     await AudioIo.instance.startWith(config);

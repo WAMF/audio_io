@@ -93,11 +93,22 @@ class AudioIoConfig {
   /// Valid range: 20–100 ms.
   final int? frameDurationMs;
 
+  /// Web only: accept the browser-controlled AudioContext rate when it
+  /// differs from [sampleRate]. On web the browser owns the sample rate
+  /// and it cannot be forced; by default [AudioIo.startWith] throws on a
+  /// mismatch so callers don't unknowingly stream audio at the wrong rate
+  /// (e.g. 48 kHz mislabelled as 16 kHz to a speech API). Set this to
+  /// `true` to proceed at the actual rate — read it back via
+  /// [AudioIo.getFormat]. Native platforms negotiate [sampleRate] with the
+  /// device and ignore this flag.
+  final bool allowSampleRateMismatch;
+
   const AudioIoConfig({
     this.sampleRate = AudioIoSampleRate.rate48000,
     this.format = AudioIoFormat.float64,
     this.latency = AudioIoLatency.Balanced,
     this.frameDurationMs,
+    this.allowSampleRateMismatch = false,
   }) : assert(
           frameDurationMs == null ||
               (frameDurationMs >= 20 && frameDurationMs <= 100),
@@ -205,6 +216,7 @@ class AudioIo {
       await _impl.start(
         sampleRate: config.sampleRate.hz,
         format: config.format.value,
+        allowSampleRateMismatch: config.allowSampleRateMismatch,
       );
       return;
     }
