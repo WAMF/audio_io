@@ -149,8 +149,18 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         switch call.method {
         case Methods.start.rawValue:
             if let args = call.arguments as? [String: Any] {
-                _requestedSampleRate = args["sampleRate"] as? Double ?? _Constants.defaultSampleRate
-                _requestedFormat = args["format"] as? String ?? _Constants.formatFloat64
+                // Dart sends `sampleRate` (int hz) and `format` (int 0=float64, 1=pcm16),
+                // both of which arrive as NSNumber over the method channel — not Double/String.
+                // Casting an int-backed NSNumber `as? String` is always nil, so the previous
+                // code silently fell back to float64 and PCM16 never activated on Apple platforms.
+                if let sampleRate = args["sampleRate"] as? NSNumber {
+                    _requestedSampleRate = sampleRate.doubleValue
+                }
+                if let format = args["format"] as? NSNumber {
+                    _requestedFormat = format.intValue == 1 ? _Constants.formatPcm16 : _Constants.formatFloat64
+                } else if let format = args["format"] as? String {
+                    _requestedFormat = format
+                }
             }
             start()
             result(nil)
