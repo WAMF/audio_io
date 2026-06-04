@@ -75,7 +75,16 @@ extension AudioBufferExt on AudioBuffer {
 
 class AudioIoWeb implements AudioIoImpl {
   static const _pcm16FormatValue = 1;
-  static const _scriptProcessorBufferSize = 2048;
+  // Default ScriptProcessor buffer (~42.67ms at 48kHz) when no explicit frame
+  // duration is requested, or when a request is too small for web to honour.
+  static const _defaultBufferSize = 2048;
+  // ScriptProcessorNode only accepts power-of-two buffer sizes in this range.
+  static const _minBufferSize = 256;
+  static const _maxBufferSize = 16384;
+  // Requests below this (e.g. the native 1.5–6ms latency presets) cannot be
+  // delivered reliably by the main-thread ScriptProcessor, so they fall back to
+  // the default buffer. The public `frameDurationMs` knob starts at 20ms.
+  static const _minHonouredFrameDuration = 0.02;
 
   AudioContext? _audioContext;
   ScriptProcessorNode? _scriptProcessor;
@@ -87,6 +96,12 @@ class AudioIoWeb implements AudioIoImpl {
   bool _isRunning = false;
   int _format = 0;
   int _requestedSampleRate = 48000;
+  // Frame duration requested via requestFrameDuration(); applied at start(),
+  // where the AudioContext sample rate is known. Null until requested.
+  double? _requestedFrameDuration;
+  // Actual ScriptProcessor buffer size chosen for the running pipeline, so
+  // getFrameDuration() can report the duration the caller really gets.
+  int _activeBufferSize = _defaultBufferSize;
 
   @override
   bool get usePlatformImpl => true;
@@ -155,8 +170,9 @@ class AudioIoWeb implements AudioIoImpl {
         await _audioContext!.resume().toDart;
       }
 
+      _activeBufferSize = _resolveBufferSize(_audioContext!.sampleRate);
       _scriptProcessor = _audioContext!.createScriptProcessor(
-        _scriptProcessorBufferSize,
+        _activeBufferSize,
         1,
         1,
       );
@@ -296,14 +312,38 @@ class AudioIoWeb implements AudioIoImpl {
 
   @override
   Future<void> requestFrameDuration(double duration) async {
-    // Web Audio API uses fixed buffer sizes
+    // The Web Audio ScriptProcessorNode buffer size is fixed at creation, so
+    // the request is recorded here and applied in start() once the
+    // AudioContext sample rate is known. Read back via getFrameDuration().
+    _requestedFrameDuration = duration;
   }
 
   @override
   Future<double> getFrameDuration() async {
-    // 2048 samples at 48kHz = ~42.67ms
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
-    return 2048 / sampleRate;
+    return _activeBufferSize / sampleRate;
+  }
+
+  /// Maps a requested frame duration to a ScriptProcessorNode buffer size.
+  ///
+  /// The Web Audio API only accepts power-of-two buffers in
+  /// [`_minBufferSize`, `_maxBufferSize`]. An explicit `frameDurationMs`
+  /// request (>= 20ms) is honoured by picking the nearest valid buffer size;
+  /// the sub-10ms native latency presets — which the main-thread
+  /// ScriptProcessor cannot deliver — fall back to the default buffer.
+  int _resolveBufferSize(double sampleRate) {
+    final requested = _requestedFrameDuration;
+    if (requested == null || requested < _minHonouredFrameDuration) {
+      return _defaultBufferSize;
+    }
+    final idealSamples = requested * sampleRate;
+    var best = _minBufferSize;
+    for (var size = _minBufferSize; size <= _maxBufferSize; size *= 2) {
+      if ((size - idealSamples).abs() < (best - idealSamples).abs()) {
+        best = size;
+      }
+    }
+    return best;
   }
 }
 
