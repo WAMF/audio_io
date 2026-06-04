@@ -23,10 +23,14 @@ extension AudioContextExt on AudioContext {
   external JSPromise resume();
   external JSPromise close();
   external ScriptProcessorNode createScriptProcessor(
-      int bufferSize, int inputChannels, int outputChannels);
+    int bufferSize,
+    int inputChannels,
+    int outputChannels,
+  );
   external AudioDestinationNode get destination;
   external MediaStreamAudioSourceNode createMediaStreamSource(
-      web.MediaStream stream);
+    web.MediaStream stream,
+  );
 }
 
 @JS()
@@ -141,8 +145,10 @@ class AudioIoWeb implements AudioIoImpl {
             'allowSampleRateMismatch: true to accept ${actualRate}Hz audio.',
           );
         }
-        debugPrint('Warning: Web AudioContext runs at ${actualRate}Hz, '
-            'requested ${sampleRate}Hz. Audio will use ${actualRate}Hz.');
+        debugPrint(
+          'Warning: Web AudioContext runs at ${actualRate}Hz, '
+          'requested ${sampleRate}Hz. Audio will use ${actualRate}Hz.',
+        );
       }
 
       if (_audioContext!.state == 'suspended') {
@@ -192,8 +198,9 @@ class AudioIoWeb implements AudioIoImpl {
 
         final outputData = outputBuffer.getChannelData(0);
         for (int i = 0; i < bufferLength; i++) {
-          final value =
-              _outputBuffer.isNotEmpty ? _outputBuffer.removeFirst() : 0.0;
+          final value = _outputBuffer.isNotEmpty
+              ? _outputBuffer.removeFirst()
+              : 0.0;
           outputData.setProperty(i.toJS, value.toJS);
         }
       }).toJS;
@@ -214,9 +221,7 @@ class AudioIoWeb implements AudioIoImpl {
 
   Future<web.MediaStream?> _getUserMedia() async {
     try {
-      final constraints = web.MediaStreamConstraints(
-        audio: true.toJS,
-      );
+      final constraints = web.MediaStreamConstraints(audio: true.toJS);
 
       final stream = await web.window.navigator.mediaDevices
           .getUserMedia(constraints)
@@ -254,18 +259,11 @@ class AudioIoWeb implements AudioIoImpl {
   @override
   Map<String, dynamic> getFormat() {
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
+    final type = _format == _pcm16FormatValue ? 'pcm16' : 'double';
 
     return {
-      'input': {
-        'type': 'double',
-        'channels': 1,
-        'sampleRate': sampleRate,
-      },
-      'output': {
-        'type': 'double',
-        'channels': 1,
-        'sampleRate': sampleRate,
-      },
+      'input': {'type': type, 'channels': 1, 'sampleRate': sampleRate},
+      'output': {'type': type, 'channels': 1, 'sampleRate': sampleRate},
     };
   }
 
