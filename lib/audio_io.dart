@@ -175,7 +175,11 @@ class AudioIo {
   }
 
   /// Start with default settings (48 kHz, Float64, Balanced latency).
+  ///
+  /// Clears any configuration from a prior [startWith] so [currentConfig]
+  /// and the native layer fall back to the float64 defaults.
   Future<void> start() async {
+    _config = null;
     if (_impl.usePlatformImpl) {
       await _impl.start();
       return;

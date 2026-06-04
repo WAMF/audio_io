@@ -148,6 +148,11 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case Methods.start.rawValue:
+            // Plain start() carries no args. Reset to defaults first so a prior
+            // startWith(pcm16/non-default rate) doesn't leak its requested format
+            // or sample rate into a subsequent default start().
+            _requestedSampleRate = _Constants.defaultSampleRate
+            _requestedFormat = _Constants.formatFloat64
             if let args = call.arguments as? [String: Any] {
                 // Dart sends `sampleRate` (int hz) and `format` (int 0=float64, 1=pcm16),
                 // both of which arrive as NSNumber over the method channel — not Double/String.
