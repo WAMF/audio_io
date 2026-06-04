@@ -71,6 +71,11 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
 
     private var sourceNode: AVAudioSourceNode?
     private var inputAudioConverter: AVAudioConverter?
+    // Sample rate / format the live pipeline (converter, source node, input tap)
+    // was actually built for. Used to detect when a stop() -> startWith(...)
+    // changes the request and the pipeline must be torn down and rebuilt.
+    private var _pipelineSampleRate: Double?
+    private var _pipelineFormat: String?
 
     private func createSourceNode() -> AVAudioSourceNode {
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1, interleaved: false)!
@@ -247,6 +252,23 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     public func setupPipelineIfNeeded() throws {
+        // stop() deliberately leaves the pipeline attached so a same-config
+        // restart is cheap. But it also means a later startWith(newRate/format)
+        // would otherwise keep the stale converter, source-node format, and
+        // input tap while getFormat() reports the new request. Tear down and
+        // rebuild whenever the requested rate/format no longer matches the
+        // pipeline that is actually wired up.
+        if _isPipelineSetup,
+           _pipelineSampleRate != _sampleRate || _pipelineFormat != _requestedFormat {
+            print("setupPipeline: config changed (\(_pipelineSampleRate ?? -1)/\(_pipelineFormat ?? "?") -> \(_sampleRate)/\(_requestedFormat)), rebuilding")
+            // Never detach nodes from a running engine. The usual stop() ->
+            // startWith(...) path already has the engine stopped; this guards the
+            // case where startWith(...) is called again without a prior stop().
+            engine.stop()
+            _isRunning = false
+            detachPipeline()
+        }
+
         if !_isPipelineSetup {
             print("setupPipeline")
             let input = engine.inputNode
@@ -289,6 +311,8 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             }
 
             _isPipelineSetup = true
+            _pipelineSampleRate = _sampleRate
+            _pipelineFormat = _requestedFormat
             print("setupPipeline complete (hwIn=\(hardwareInputFormat.sampleRate) requested=\(_sampleRate))")
         }
     }
@@ -298,8 +322,11 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         engine.inputNode.removeTap(onBus: 0)
         if let sourceNode = sourceNode {
             engine.detach(sourceNode)
+            self.sourceNode = nil
         }
         inputAudioConverter = nil
+        _pipelineSampleRate = nil
+        _pipelineFormat = nil
         _isPipelineSetup = false
     }
 
