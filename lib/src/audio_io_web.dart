@@ -207,19 +207,24 @@ class AudioIoWeb implements AudioIoImpl {
 
       _scriptProcessor!.connect(_audioContext!.destination);
 
+      // _getUserMedia() throws on permission/device failure. Letting it
+      // propagate means a denied mic surfaces as a startup error rather than a
+      // "successful" start with permanently silent input.
       final mediaStream = await _getUserMedia();
-      if (mediaStream != null) {
-        final source = _audioContext!.createMediaStreamSource(mediaStream);
-        source.connect(_scriptProcessor!);
-      }
+      final source = _audioContext!.createMediaStreamSource(mediaStream);
+      source.connect(_scriptProcessor!);
 
       _isRunning = true;
     } catch (e) {
+      // Any failure between AudioContext creation and a fully-running pipeline
+      // (sample-rate mismatch, mic acquisition, etc.) must leave no half-open
+      // context/processor/controllers behind and keep _isRunning false.
+      await _teardownAfterFailedStart();
       throw Exception('Failed to start audio: $e');
     }
   }
 
-  Future<web.MediaStream?> _getUserMedia() async {
+  Future<web.MediaStream> _getUserMedia() async {
     try {
       final constraints = web.MediaStreamConstraints(audio: true.toJS);
 
@@ -229,8 +234,30 @@ class AudioIoWeb implements AudioIoImpl {
       return stream;
     } catch (e) {
       debugPrint('Failed to get user media: $e');
-      return null;
+      throw StateError(
+        'Microphone access failed (permission denied or no input device): $e',
+      );
     }
+  }
+
+  Future<void> _teardownAfterFailedStart() async {
+    _isRunning = false;
+
+    _scriptProcessor?.disconnect();
+    _scriptProcessor = null;
+
+    await _audioContext?.close().toDart;
+    _audioContext = null;
+
+    await _inputController?.close();
+    await _outputController?.close();
+    await _inputBytesController?.close();
+    await _outputBytesController?.close();
+    _inputController = null;
+    _outputController = null;
+    _inputBytesController = null;
+    _outputBytesController = null;
+    _outputBuffer.clear();
   }
 
   @override
