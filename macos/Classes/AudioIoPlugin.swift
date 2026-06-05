@@ -57,7 +57,6 @@ enum _AudioFormat {
 
 public class AudioIoPlugin: NSObject, FlutterPlugin {
     let engine = AVAudioEngine()
-    var inputConverter = AVAudioMixerNode()
     var _binaryMessenger: FlutterBinaryMessenger?
     var _frameDuration = _Constants.defaultFrameDuration
     var _sampleRate = _Constants.defaultSampleRate
@@ -71,6 +70,12 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     var _resetting = false
 
     private var sourceNode: AVAudioSourceNode?
+    private var inputAudioConverter: AVAudioConverter?
+    // Sample rate / format the live pipeline (converter, source node, input tap)
+    // was actually built for. Used to detect when a stop() -> startWith(...)
+    // changes the request and the pipeline must be torn down and rebuilt.
+    private var _pipelineSampleRate: Double?
+    private var _pipelineFormat: String?
 
     private func createSourceNode() -> AVAudioSourceNode {
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1, interleaved: false)!
@@ -90,18 +95,48 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         })
     }
 
-    private lazy var sinkNode = AVAudioSinkNode { _, frames, audioBufferList ->
-        OSStatus in
-        let sampleCount = Int(frames)
-        let ptr = audioBufferList.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self)
-        let unsafePtr = UnsafeBufferPointer(start: ptr, count: sampleCount)
+    // Captured mic audio arrives at the hardware rate via the input tap and is
+    // resampled down to the requested rate by `inputAudioConverter` before it is
+    // converted to PCM16/Float64 and pushed to Flutter. macOS has no
+    // AVAudioSession to negotiate the device rate, so the conversion must happen
+    // explicitly here — otherwise the mic always streams at 48 kHz.
+    private func handleCapturedBuffer(_ inputBuffer: AVAudioPCMBuffer) {
+        guard let converter = inputAudioConverter else { return }
+        let outputFormat = converter.outputFormat
+
+        let ratio = outputFormat.sampleRate / inputBuffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio) + 64
+        guard capacity > 0,
+              let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity)
+        else { return }
+
+        var consumed = false
+        var error: NSError?
+        let status = converter.convert(to: outputBuffer, error: &error) { _, inStatus in
+            if consumed {
+                inStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            inStatus.pointee = .haveData
+            return inputBuffer
+        }
+
+        if status == .error || error != nil {
+            print("Input conversion error \(String(describing: error))")
+            return
+        }
+
+        let sampleCount = Int(outputBuffer.frameLength)
+        guard sampleCount > 0, let channel = outputBuffer.floatChannelData else { return }
+        let samples = channel[0]
 
         let data: Data
-        if self._requestedFormat == _Constants.formatPcm16 {
+        if _requestedFormat == _Constants.formatPcm16 {
             var int16Samples = [Int16](repeating: 0, count: sampleCount)
             var i = 0
             while i < sampleCount {
-                let clamped = min(max(unsafePtr[i], -1.0), 1.0)
+                let clamped = min(max(samples[i], -1.0), 1.0)
                 int16Samples[i] = Int16(clamped * _Constants.pcm16ScaleFactor)
                 i += 1
             }
@@ -110,14 +145,13 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             var doubleSamples = [Double](repeating: 0.0, count: sampleCount)
             var i = 0
             while i < sampleCount {
-                doubleSamples[i] = Double(unsafePtr[i])
+                doubleSamples[i] = Double(samples[i])
                 i += 1
             }
             data = Data(fromArray: doubleSamples)
         }
 
-        self._binaryMessenger?.send(onChannel: Channels.inputChannelName.rawValue, message: data)
-        return noErr
+        _binaryMessenger?.send(onChannel: Channels.inputChannelName.rawValue, message: data)
     }
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -195,7 +229,12 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     public func start() {
         print("Start Audio Engine")
         _sampleRate = _requestedSampleRate
-        buffer = RingBuffer<Float>(count: Int(_frameDuration * _sampleRate * maxFrameJitter))
+        // Output is fed from the network (Gemini) in bursts, so the playback ring
+        // buffer must hold seconds — not milliseconds — of audio to avoid
+        // underruns. Sized at the requested rate because the sourceNode renders
+        // at the requested rate and the mixer resamples up to the hardware rate.
+        let bufferSize = max(Int(_sampleRate * 10.0), 131072)
+        buffer = RingBuffer<Float>(count: bufferSize)
 
         do {
             try setupPipelineIfNeeded()
@@ -203,8 +242,6 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             print("Audio pipeline error \(error)")
             return
         }
-
-        inputConverter.outputVolume = 1.0
 
         do {
             try engine.start()
@@ -215,34 +252,81 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     public func setupPipelineIfNeeded() throws {
+        // stop() deliberately leaves the pipeline attached so a same-config
+        // restart is cheap. But it also means a later startWith(newRate/format)
+        // would otherwise keep the stale converter, source-node format, and
+        // input tap while getFormat() reports the new request. Tear down and
+        // rebuild whenever the requested rate/format no longer matches the
+        // pipeline that is actually wired up.
+        if _isPipelineSetup,
+           _pipelineSampleRate != _sampleRate || _pipelineFormat != _requestedFormat {
+            print("setupPipeline: config changed (\(_pipelineSampleRate ?? -1)/\(_pipelineFormat ?? "?") -> \(_sampleRate)/\(_requestedFormat)), rebuilding")
+            // Never detach nodes from a running engine. The usual stop() ->
+            // startWith(...) path already has the engine stopped; this guards the
+            // case where startWith(...) is called again without a prior stop().
+            engine.stop()
+            _isRunning = false
+            detachPipeline()
+        }
+
         if !_isPipelineSetup {
             print("setupPipeline")
             let input = engine.inputNode
             let output = engine.mainMixerNode
-            let inputFormat = input.inputFormat(forBus: 0)
-            _sampleRate = inputFormat.sampleRate
-            inputConverter.outputVolume = 1.0
+
+            // Keep the engine at the hardware rate and convert at the boundaries
+            // (the pattern Apple recommends): _sampleRate stays at the *requested*
+            // rate so Flutter receives the rate it asked for. Previously
+            // `_sampleRate` was overwritten with `inputFormat.sampleRate`, which
+            // forced the whole pipeline to 48 kHz — playback ran ~3x fast and the
+            // mic streamed at 48 kHz while Gemini expects 16 kHz.
+            let hardwareInputFormat = input.outputFormat(forBus: 0)
+            guard hardwareInputFormat.sampleRate > 0 else {
+                throw NSError(domain: Channels.methodChannelName.rawValue, code: -1,
+                              userInfo: [NSLocalizedDescriptionKey: "Input device unavailable (sampleRate 0). Check microphone permission/entitlement."])
+            }
+            let processingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                                 sampleRate: _sampleRate,
+                                                 channels: 1,
+                                                 interleaved: false)!
+
+            // Output: Dart writes requested-rate float into the ring buffer; the
+            // sourceNode renders at the requested rate and the main mixer
+            // resamples up to the hardware output rate.
             let sourceNode = createSourceNode()
-            let processingformat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1, interleaved: false)
-            engine.attach(inputConverter)
-            engine.attach(sinkNode)
             engine.attach(sourceNode)
-            engine.connect(input, to: inputConverter, format: inputFormat)
-            engine.connect(inputConverter, to: sinkNode, format: processingformat)
-            engine.connect(sourceNode, to: output, format: nil)
+            engine.connect(sourceNode, to: output, format: processingFormat)
             self.sourceNode = sourceNode
+
+            // Input: tap the mic at the hardware rate and resample down to the
+            // requested rate with a persistent converter (state carries across
+            // callbacks, so there are no resampling discontinuities).
+            guard let converter = AVAudioConverter(from: hardwareInputFormat, to: processingFormat) else {
+                throw NSError(domain: Channels.methodChannelName.rawValue, code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "Could not create input converter \(hardwareInputFormat) -> \(processingFormat)"])
+            }
+            inputAudioConverter = converter
+            input.installTap(onBus: 0, bufferSize: 4096, format: hardwareInputFormat) { [weak self] buffer, _ in
+                self?.handleCapturedBuffer(buffer)
+            }
+
             _isPipelineSetup = true
-            print("setupPipeline complete")
+            _pipelineSampleRate = _sampleRate
+            _pipelineFormat = _requestedFormat
+            print("setupPipeline complete (hwIn=\(hardwareInputFormat.sampleRate) requested=\(_sampleRate))")
         }
     }
 
     public func detachPipeline() {
         print("detachPipeline")
-        engine.detach(inputConverter)
-        engine.detach(sinkNode)
+        engine.inputNode.removeTap(onBus: 0)
         if let sourceNode = sourceNode {
             engine.detach(sourceNode)
+            self.sourceNode = nil
         }
+        inputAudioConverter = nil
+        _pipelineSampleRate = nil
+        _pipelineFormat = nil
         _isPipelineSetup = false
     }
 
