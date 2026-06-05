@@ -43,6 +43,10 @@ class _SampleRates {
   static const ratio = output / input;
 }
 
+class _Playback {
+  static const bytesPerSecond = _SampleRates.input * 2;
+}
+
 class GeminiLivePage extends StatefulWidget {
   const GeminiLivePage({super.key});
 
@@ -57,6 +61,9 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   WebSocketChannel? _channel;
   StreamSubscription<Uint8List>? _audioSubscription;
   StreamSubscription<dynamic>? _wsSubscription;
+  var _micSuppressed = false;
+  DateTime? _playbackEndsAt;
+  Timer? _resumeMicTimer;
 
   bool get _isActive =>
       _state == _ConnectionState.connected ||
@@ -183,6 +190,7 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
     await AudioIo.instance.startWith(config);
 
     _audioSubscription = AudioIo.instance.inputBytes.listen((pcmChunk) {
+      if (_micSuppressed) return;
       final encoded = base64Encode(pcmChunk);
       final message = jsonEncode({
         'realtimeInput': {
@@ -202,6 +210,16 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
     final serverContent = json['serverContent'] as Map<String, dynamic>?;
     if (serverContent == null) return;
 
+    _playModelAudio(serverContent);
+
+    final turnComplete = serverContent['turnComplete'] == true;
+    final interrupted = serverContent['interrupted'] == true;
+    if (turnComplete || interrupted) {
+      _resumeMicAfterPlayback();
+    }
+  }
+
+  void _playModelAudio(Map<String, dynamic> serverContent) {
     final modelTurn = serverContent['modelTurn'] as Map<String, dynamic>?;
     if (modelTurn == null) return;
 
@@ -222,10 +240,47 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
       final pcm24k = base64Decode(data);
       final pcm16k = _resample24kTo16k(Uint8List.fromList(pcm24k));
       AudioIo.instance.outputBytes.add(pcm16k);
+      _suppressMicWhilePlaying(pcm16k.length);
     }
   }
 
+  void _suppressMicWhilePlaying(int byteCount) {
+    _resumeMicTimer?.cancel();
+    _resumeMicTimer = null;
+
+    final now = DateTime.now();
+    final base = (_playbackEndsAt != null && _playbackEndsAt!.isAfter(now))
+        ? _playbackEndsAt!
+        : now;
+    final chunkMs = (byteCount * Duration.millisecondsPerSecond) ~/
+        _Playback.bytesPerSecond;
+    _playbackEndsAt = base.add(Duration(milliseconds: chunkMs));
+
+    if (!_micSuppressed) {
+      setState(() => _micSuppressed = true);
+    }
+  }
+
+  void _resumeMicAfterPlayback() {
+    final now = DateTime.now();
+    final endsAt = _playbackEndsAt;
+    final remaining = (endsAt != null && endsAt.isAfter(now))
+        ? endsAt.difference(now)
+        : Duration.zero;
+
+    _resumeMicTimer?.cancel();
+    _resumeMicTimer = Timer(remaining, () {
+      _playbackEndsAt = null;
+      if (!mounted) return;
+      setState(() => _micSuppressed = false);
+    });
+  }
+
   Future<void> _stopAudio() async {
+    _resumeMicTimer?.cancel();
+    _resumeMicTimer = null;
+    _playbackEndsAt = null;
+    _micSuppressed = false;
     await _audioSubscription?.cancel();
     _audioSubscription = null;
     await AudioIo.instance.stop();
@@ -276,6 +331,10 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
                 isConnecting: _state == _ConnectionState.connecting,
                 onPressed: _toggleConnection,
               ),
+              if (_state == _ConnectionState.connected) ...[
+                const SizedBox(height: 24),
+                _MicStatus(suppressed: _micSuppressed),
+              ],
             ],
           ),
         ),
@@ -375,6 +434,31 @@ class _MicButton extends StatelessWidget {
                 size: 36,
               ),
       ),
+    );
+  }
+}
+
+class _MicStatus extends StatelessWidget {
+  const _MicStatus({required this.suppressed});
+
+  final bool suppressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = suppressed ? Colors.orange : Colors.green;
+    final icon = suppressed ? Icons.mic_off : Icons.mic;
+    final label = suppressed ? 'Gemini speaking — mic muted' : 'Listening';
+
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(icon, color: color, size: 20),
+        const SizedBox(width: 8),
+        Text(
+          label,
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: color),
+        ),
+      ],
     );
   }
 }
