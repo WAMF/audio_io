@@ -76,6 +76,11 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     // changes the request and the pipeline must be torn down and rebuilt.
     private var _pipelineSampleRate: Double?
     private var _pipelineFormat: String?
+    // Throttle state for the per-buffer conversion-error log so a sustained
+    // converter failure logs roughly once per second instead of flooding the
+    // console at the buffer rate.
+    private var _lastConversionErrorLog: TimeInterval = 0
+    private var _suppressedConversionErrors = 0
 
     private func createSourceNode() -> AVAudioSourceNode {
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1, interleaved: false)!
@@ -93,6 +98,20 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             }
             return noErr
         })
+    }
+
+    private func logConversionErrorThrottled(_ error: NSError?) {
+        _suppressedConversionErrors += 1
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - _lastConversionErrorLog >= 1.0 else { return }
+        let count = _suppressedConversionErrors
+        _suppressedConversionErrors = 0
+        _lastConversionErrorLog = now
+        if count > 1 {
+            print("Input conversion error (\(count) in last 1s) \(String(describing: error))")
+        } else {
+            print("Input conversion error \(String(describing: error))")
+        }
     }
 
     // Captured mic audio arrives at the hardware rate via the input tap and is
@@ -124,7 +143,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         }
 
         if status == .error || error != nil {
-            print("Input conversion error \(String(describing: error))")
+            logConversionErrorThrottled(error)
             return
         }
 
