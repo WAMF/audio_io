@@ -16,10 +16,12 @@ extension Data {
 enum _Constants {
     static let preferedSampleRate = 48000.0
     static let workspaceSamples = 100_000
-    static let defaultFrameDuration = 0.003  // (3ms)
+    static let defaultFrameDuration = 0.003
     static let defaultMaxFrameJitter = 4.0
     static let processingQueueName = "SwiftAudioIoPluginQueue"
-    static let ringBufferSize = 2048
+    static let ringBufferSize = 4096
+    static let bufferStatusFieldCount = 2
+    static let bufferStatusMinInterval: UInt64 = 1_000_000
 }
 
 enum Methods: String {
@@ -44,6 +46,7 @@ enum Channels: String {
     case inputChannelName = "com.wearemobilefirst.audio_io.inputAudio"
     case outputChannelName = "com.wearemobilefirst.audio_io.outputAudio"
     case methodChannelName = "com.wearemobilefirst.audio_io"
+    case bufferStatusChannelName = "com.wearemobilefirst.audio_io.bufferStatus"
 }
 
 enum AudioDataTypes: String {
@@ -102,16 +105,39 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     var buffer = RingBuffer<Double>(count: 0)
     let maxFrameJitter = _Constants.defaultMaxFrameJitter
     let queue = DispatchQueue(label: _Constants.processingQueueName)
+    private var bufferLock = os_unfair_lock()
     var _isRunning = false
     var _isPipelineSetup = false
     var _resetting = false
     var bufferPool: DataBufferPool?
+    var _bufferCapacity = 0
+    private var _lastBufferStatusTime: UInt64 = 0
 
     private var sourceNode: AVAudioSourceNode?
 
     deinit {
         NotificationCenter.default.removeObserver(self)
         engine.stop()
+    }
+
+    private func sendBufferStatus(available: Int, capacity: Int) {
+        let now = mach_absolute_time()
+        guard now - _lastBufferStatusTime >= _Constants.bufferStatusMinInterval else { return }
+        _lastBufferStatusTime = now
+
+        let byteCount = _Constants.bufferStatusFieldCount * MemoryLayout<Int32>.stride
+        var data = Data(count: byteCount)
+        data.withUnsafeMutableBytes { ptr in
+            let ints = ptr.bindMemory(to: Int32.self)
+            ints[0] = Int32(available)
+            ints[1] = Int32(capacity)
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?._binaryMessenger?.send(
+                onChannel: Channels.bufferStatusChannelName.rawValue,
+                message: data
+            )
+        }
     }
 
     private func createSourceNode() -> AVAudioSourceNode {
@@ -123,16 +149,27 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             renderBlock: { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
                 guard let self = self else { return noErr }
                 let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                self.queue.sync {
-                    for buffer in ablPointer {
-                        let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(
-                            buffer)
-                        var i = 0
-                        while i < frameCount {
-                            buf[i] = self.buffer.read() ?? 0
-                            i += 1
-                        }
+                var availableAfterRead = 0
+                var capacity = 0
+                os_unfair_lock_lock(&self.bufferLock)
+                for buffer in ablPointer {
+                    let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(
+                        buffer)
+                    var i = 0
+                    while i < frameCount {
+                        buf[i] = self.buffer.read() ?? 0
+                        i += 1
                     }
+                }
+                availableAfterRead = self.buffer.availableForReading
+                capacity = self._bufferCapacity
+                os_unfair_lock_unlock(&self.bufferLock)
+
+                if capacity > 0 {
+                    self.sendBufferStatus(
+                        available: availableAfterRead,
+                        capacity: capacity
+                    )
                 }
                 return noErr
             })
@@ -183,17 +220,17 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                     return
                 }
                 autoreleasepool {
-                    instance.queue.sync {
-                        let count = data.count / MemoryLayout<Double>.stride
-                        data.withUnsafeBytes { rawPtr in
-                            let doubles = rawPtr.bindMemory(to: Double.self)
-                            for i in 0..<count {
-                                if !instance.buffer.write(doubles[i]) {
-                                    break
-                                }
+                    os_unfair_lock_lock(&instance.bufferLock)
+                    let count = data.count / MemoryLayout<Double>.stride
+                    data.withUnsafeBytes { rawPtr in
+                        let doubles = rawPtr.bindMemory(to: Double.self)
+                        for i in 0..<count {
+                            if !instance.buffer.write(doubles[i]) {
+                                break
                             }
                         }
                     }
+                    os_unfair_lock_unlock(&instance.bufferLock)
                 }
             })
 
@@ -222,10 +259,10 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                     do {
                         try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(
                             _frameDuration)
-                        buffer = RingBuffer<Double>(
-                            count: max(
-                                _Constants.ringBufferSize,
-                                Int(_frameDuration * _sampleRate * maxFrameJitter)))
+                        _bufferCapacity = max(
+                            _Constants.ringBufferSize,
+                            Int(_frameDuration * _sampleRate * maxFrameJitter))
+                        buffer = RingBuffer<Double>(count: _bufferCapacity)
                     } catch {
                     }
                 }
@@ -280,9 +317,9 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     private func startInternal() throws {
-        buffer = RingBuffer<Double>(
-            count: max(
-                _Constants.ringBufferSize, Int(_frameDuration * _sampleRate * maxFrameJitter)))
+        _bufferCapacity = max(
+            _Constants.ringBufferSize, Int(_frameDuration * _sampleRate * maxFrameJitter))
+        buffer = RingBuffer<Double>(count: _bufferCapacity)
 
         let expectedFrameSize = Int(_frameDuration * _sampleRate)
         let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
@@ -446,7 +483,9 @@ public struct RingBuffer<T> {
 
     public mutating func read() -> T? {
         if !isEmpty {
-            let element = array[readIndex % array.count]
+            let index = readIndex % array.count
+            let element = array[index]
+            array[index] = nil
             readIndex = (readIndex + 1) % (array.count * 2)
             return element
         } else {
@@ -472,7 +511,15 @@ public struct RingBuffer<T> {
     }
 
     fileprivate var availableSpaceForReading: Int {
-        return writeIndex - readIndex
+        let diff = writeIndex - readIndex
+        if diff < 0 {
+            return diff + (array.count * 2)
+        }
+        return diff
+    }
+
+    public var availableForReading: Int {
+        return availableSpaceForReading
     }
 
     public var isEmpty: Bool {

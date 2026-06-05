@@ -2,6 +2,9 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'src/audio_io_stub.dart' show AudioBufferStatus;
+export 'src/audio_io_stub.dart' show AudioBufferStatus;
+
 // Conditional imports for platform-specific implementations
 import 'src/audio_io_stub.dart'
     if (dart.library.io) 'src/audio_io_native.dart'
@@ -36,11 +39,14 @@ class _Channels {
   static const methodChannelName = 'com.wearemobilefirst.audio_io';
   static const audioInput = 'com.wearemobilefirst.audio_io.inputAudio';
   static const audioOutput = 'com.wearemobilefirst.audio_io.outputAudio';
+  static const bufferStatus = 'com.wearemobilefirst.audio_io.bufferStatus';
 }
 
 class _Constants {
   static const bytesPerSample = 8;
+  static const bytesPerInt32 = 4;
   static const millisecPerSec = 1000;
+  static const bufferStatusFieldCount = 2;
 }
 
 enum AudioIoLatency {
@@ -53,6 +59,22 @@ final Map<AudioIoLatency, double> _presetLatency = {
   AudioIoLatency.Realtime: 1.5 / 1000.0,
   AudioIoLatency.Balanced: 3.0 / 1000.0,
   AudioIoLatency.Powersave: 6.0 / 1000.0,
+};
+
+const Map<AudioIoLatency, double> audioIoFrameSizeSeconds = {
+  AudioIoLatency.Realtime: 0.05,
+  AudioIoLatency.Balanced: 0.1,
+  AudioIoLatency.Powersave: 0.25,
+};
+
+enum AudioBufferStrategy {
+  lowLatency,
+  balanced,
+}
+
+const Map<AudioBufferStrategy, double> audioBufferStrategyThreshold = {
+  AudioBufferStrategy.lowLatency: 0.5,
+  AudioBufferStrategy.balanced: 0.75,
 };
 
 enum AudioIoQuality {
@@ -76,6 +98,8 @@ class AudioIo {
       StreamController<List<double>>.broadcast(sync: true);
   StreamController<List<double>> _inputController =
       StreamController<List<double>>.broadcast(sync: true);
+  StreamController<AudioBufferStatus> _bufferStatusController =
+      StreamController<AudioBufferStatus>.broadcast(sync: true);
 
 
   Stream<List<double>> get input {
@@ -86,6 +110,13 @@ class AudioIo {
   }
 
   static final _fallbackController = StreamController<List<double>>();
+
+  Stream<AudioBufferStatus> get bufferStatus {
+    if (_impl.usePlatformImpl) {
+      return _impl.bufferStatusStream ?? const Stream.empty();
+    }
+    return _bufferStatusController.stream;
+  }
 
   Sink<List<double>> get output {
     if (_impl.usePlatformImpl) {
@@ -121,6 +152,25 @@ class AudioIo {
         return null;
       },
     );
+    ServicesBinding.instance.defaultBinaryMessenger.setMessageHandler(
+      _Channels.bufferStatus,
+      (ByteData? message) {
+        if (message != null && _bufferStatusController.hasListener) {
+          final expectedBytes =
+              _Constants.bufferStatusFieldCount * _Constants.bytesPerInt32;
+          if (message.lengthInBytes >= expectedBytes) {
+            final available = message.getInt32(0, Endian.little);
+            final capacity =
+                message.getInt32(_Constants.bytesPerInt32, Endian.little);
+            _bufferStatusController.sink.add(AudioBufferStatus(
+              availableFrames: available,
+              capacityFrames: capacity,
+            ));
+          }
+        }
+        return null;
+      },
+    );
     try {
       await _methods.invokeMethod(_Methods.start);
     } on PlatformException catch (e) {
@@ -137,6 +187,8 @@ class AudioIo {
     _outputSubscription = null;
     ServicesBinding.instance.defaultBinaryMessenger
         .setMessageHandler(_Channels.audioInput, null);
+    ServicesBinding.instance.defaultBinaryMessenger
+        .setMessageHandler(_Channels.bufferStatus, null);
     await _methods.invokeMethod(_Methods.stop);
   }
 

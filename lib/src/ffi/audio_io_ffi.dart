@@ -3,7 +3,13 @@ import 'dart:ffi';
 
 import 'package:ffi/ffi.dart';
 
+import '../audio_io_stub.dart' show AudioBufferStatus;
 import 'audio_io_bindings.dart';
+
+class _FFIConstants {
+  static const bufferLowWaterMark = 0.25;
+  static const defaultBufferCapacity = 4096;
+}
 
 class AudioIoFFI {
   static AudioIoFFI? _instance;
@@ -14,11 +20,13 @@ class AudioIoFFI {
 
   StreamController<List<double>>? _inputController;
   StreamController<List<double>>? _outputController;
+  StreamController<AudioBufferStatus>? _bufferStatusController;
 
   Timer? _inputTimer;
 
   bool _isRunning = false;
-  double _requestedFrameDuration = 0.003; // Default to Balanced (3ms)
+  int _bufferCapacity = _FFIConstants.defaultBufferCapacity;
+  double _requestedFrameDuration = 0.003;
 
   AudioIoFFI._() {
     _bindings = AudioIoBindings();
@@ -26,6 +34,8 @@ class AudioIoFFI {
 
   Stream<List<double>>? get inputAudioStream => _inputController?.stream;
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
+  Stream<AudioBufferStatus>? get bufferStatusStream =>
+      _bufferStatusController?.stream;
 
   Future<void> start() async {
     if (_isRunning) return;
@@ -49,6 +59,7 @@ class AudioIoFFI {
 
     _inputController = StreamController<List<double>>.broadcast();
     _outputController = StreamController<List<double>>();
+    _bufferStatusController = StreamController<AudioBufferStatus>.broadcast();
 
     _outputController!.stream.listen((data) {
       _writeAudio(data);
@@ -67,8 +78,10 @@ class AudioIoFFI {
 
     await _inputController?.close();
     await _outputController?.close();
+    await _bufferStatusController?.close();
     _inputController = null;
     _outputController = null;
+    _bufferStatusController = null;
 
     if (_handle != null) {
       _bindings.stop(_handle!);
@@ -103,7 +116,25 @@ class AudioIoFFI {
           malloc.free(buffer);
         }
       }
+
+      _checkBufferStatus();
     });
+  }
+
+  void _checkBufferStatus() {
+    if (_handle == null || _bufferStatusController == null) return;
+
+    final availableWriteSpace = _bindings.getAvailableWriteSpace(_handle!);
+    final availableForReading = _bufferCapacity - availableWriteSpace;
+    final fillRatio = availableForReading / _bufferCapacity;
+    final lowWaterMark = _FFIConstants.bufferLowWaterMark;
+
+    if (fillRatio < lowWaterMark) {
+      _bufferStatusController?.add(AudioBufferStatus(
+        availableFrames: availableForReading,
+        capacityFrames: _bufferCapacity,
+      ));
+    }
   }
 
   void _writeAudio(List<double> data) {

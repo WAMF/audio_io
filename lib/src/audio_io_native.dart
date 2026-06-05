@@ -18,6 +18,9 @@ class AudioIoNative implements AudioIoImpl {
   StreamSink<List<double>>? get outputAudioStream => _ffi?.outputAudioStream;
 
   @override
+  Stream<AudioBufferStatus>? get bufferStatusStream => _ffi?.bufferStatusStream;
+
+  @override
   Future<void> start() async {
     _ffi = AudioIoFFI.instance;
     await _ffi!.start();

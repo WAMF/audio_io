@@ -66,6 +66,10 @@ extension AudioBufferExt on AudioBuffer {
   external int get length;
 }
 
+class _WebConstants {
+  static const bufferLowWaterMark = 0.25;
+}
+
 class AudioIoWeb implements AudioIoImpl {
   AudioContext? _audioContext;
   ScriptProcessorNode? _scriptProcessor;
@@ -73,18 +77,24 @@ class AudioIoWeb implements AudioIoImpl {
   StreamController<List<double>>? _outputController;
   List<double> _outputBuffer = [];
   bool _isRunning = false;
-  double _requestedFrameDuration = 0.003; // Default 3ms (Balanced)
-  int _bufferSize =
-      2048; // Default buffer size (matches previous hardcoded value)
+  double _requestedFrameDuration = 0.003;
+  int _bufferSize = 2048;
+  int _bufferCapacity = 8192;
 
   @override
   bool get usePlatformImpl => true;
+
+  StreamController<AudioBufferStatus>? _bufferStatusController;
 
   @override
   Stream<List<double>>? get inputAudioStream => _inputController?.stream;
 
   @override
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
+
+  @override
+  Stream<AudioBufferStatus>? get bufferStatusStream =>
+      _bufferStatusController?.stream;
 
   // Calculate optimal buffer size based on requested frame duration
   int _calculateBufferSize(double sampleRate) {
@@ -127,6 +137,8 @@ class AudioIoWeb implements AudioIoImpl {
 
       _inputController = StreamController<List<double>>.broadcast();
       _outputController = StreamController<List<double>>();
+      _bufferStatusController = StreamController<AudioBufferStatus>.broadcast();
+      _bufferCapacity = _bufferSize * 4;
 
       // Listen for output data
       _outputController!.stream.listen((data) {
@@ -162,6 +174,9 @@ class AudioIoWeb implements AudioIoImpl {
               _outputBuffer.isNotEmpty ? _outputBuffer.removeAt(0) : 0.0;
           outputData.setProperty(i.toJS, value.toJS);
         }
+
+        // Check buffer status
+        _checkBufferStatus();
       }).toJS;
 
       // Connect to speakers
@@ -196,6 +211,21 @@ class AudioIoWeb implements AudioIoImpl {
     }
   }
 
+  void _checkBufferStatus() {
+    if (_bufferStatusController == null) return;
+
+    final availableForReading = _outputBuffer.length;
+    final fillRatio = availableForReading / _bufferCapacity;
+    final lowWaterMark = _WebConstants.bufferLowWaterMark;
+
+    if (fillRatio < lowWaterMark) {
+      _bufferStatusController?.add(AudioBufferStatus(
+        availableFrames: availableForReading,
+        capacityFrames: _bufferCapacity,
+      ));
+    }
+  }
+
   @override
   Future<void> stop() async {
     if (!_isRunning) return;
@@ -207,8 +237,10 @@ class AudioIoWeb implements AudioIoImpl {
     _audioContext = null;
     await _inputController?.close();
     await _outputController?.close();
+    await _bufferStatusController?.close();
     _inputController = null;
     _outputController = null;
+    _bufferStatusController = null;
     _outputBuffer.clear();
   }
 
