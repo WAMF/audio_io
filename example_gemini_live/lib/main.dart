@@ -45,6 +45,11 @@ class _SampleRates {
 
 class _Playback {
   static const bytesPerSecond = _SampleRates.input * 2;
+
+  // Extra grace added to the estimated drain time before the self-healing
+  // watchdog lifts mic suppression. Covers playback/scheduling jitter so the
+  // mic doesn't reopen a hair early and re-capture the tail of model audio.
+  static const watchdogMargin = Duration(milliseconds: 250);
 }
 
 class GeminiLivePage extends StatefulWidget {
@@ -245,9 +250,6 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   }
 
   void _suppressMicWhilePlaying(int byteCount) {
-    _resumeMicTimer?.cancel();
-    _resumeMicTimer = null;
-
     final now = DateTime.now();
     final base = (_playbackEndsAt != null && _playbackEndsAt!.isAfter(now))
         ? _playbackEndsAt!
@@ -256,12 +258,24 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
         _Playback.bytesPerSecond;
     _playbackEndsAt = base.add(Duration(milliseconds: chunkMs));
 
+    // Self-healing watchdog: re-arm the resume timer on every chunk so the mic
+    // recovers even if the turnComplete/interrupted signal is dropped or the
+    // socket hiccups mid-turn. Each new chunk pushes the deadline out; once
+    // audio stops arriving the timer fires after the estimated drain time plus
+    // a small margin and lifts suppression — without it a lost signal would
+    // leave the mic muted for the rest of the session.
+    _armMicResume(_Playback.watchdogMargin);
+
     if (!_micSuppressed) {
       setState(() => _micSuppressed = true);
     }
   }
 
-  void _resumeMicAfterPlayback() {
+  // Authoritative end-of-turn signal: resume as soon as the current audio has
+  // drained, no watchdog margin needed.
+  void _resumeMicAfterPlayback() => _armMicResume(Duration.zero);
+
+  void _armMicResume(Duration margin) {
     final now = DateTime.now();
     final endsAt = _playbackEndsAt;
     final remaining = (endsAt != null && endsAt.isAfter(now))
@@ -269,7 +283,7 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
         : Duration.zero;
 
     _resumeMicTimer?.cancel();
-    _resumeMicTimer = Timer(remaining, () {
+    _resumeMicTimer = Timer(remaining + margin, () {
       _playbackEndsAt = null;
       if (!mounted) return;
       setState(() => _micSuppressed = false);
