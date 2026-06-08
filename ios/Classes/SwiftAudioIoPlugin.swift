@@ -81,6 +81,8 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     // console at the buffer rate.
     private var _lastConversionErrorLog: TimeInterval = 0
     private var _suppressedConversionErrors = 0
+    private var _lastOutputOverflowLog: TimeInterval = 0
+    private var _suppressedOverflowSamples = 0
 
     private func createSourceNode() -> AVAudioSourceNode {
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1, interleaved: false)!
@@ -112,6 +114,16 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         } else {
             print("Input conversion error \(String(describing: error))")
         }
+    }
+
+    private func logOutputOverflowThrottled(_ discarded: Int) {
+        _suppressedOverflowSamples += discarded
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - _lastOutputOverflowLog >= 1.0 else { return }
+        let total = _suppressedOverflowSamples
+        _suppressedOverflowSamples = 0
+        _lastOutputOverflowLog = now
+        print("Output buffer overflow: dropped \(total) oldest sample(s) in last 1s (producer outpacing playback)")
     }
 
     // Captured mic audio arrives at the hardware rate via the input tap and is
@@ -184,14 +196,18 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                 return
             }
             instance.queue.async {
+                let discarded: Int
                 if instance._requestedFormat == _Constants.formatPcm16 {
                     let int16s: [Int16] = data.toArray(type: Int16.self)
                     let floats = int16s.map { Float($0) / _Constants.pcm16ScaleFactor }
-                    _ = instance.buffer.writeBlock(floats)
+                    discarded = instance.buffer.writeBlock(floats)
                 } else {
                     let doubles: [Double] = data.toArray(type: Double.self)
                     let floats = doubles.map { Float($0) }
-                    _ = instance.buffer.writeBlock(floats)
+                    discarded = instance.buffer.writeBlock(floats)
+                }
+                if discarded > 0 {
+                    instance.logOutputOverflowThrottled(discarded)
                 }
             }
         })
@@ -484,30 +500,46 @@ public struct RingBuffer<T> {
         }
     }
 
-    public mutating func writeBlock(_ block: [T]) -> Bool {
+    @discardableResult
+    public mutating func writeBlock(_ block: [T]) -> Int {
         let count = block.count
-        guard availableSpaceForWriting >= count else {
-            return false
+        if count == 0 {
+            return 0
+        }
+
+        // A burst larger than the whole ring can only retain its most recent
+        // array.count samples; the earlier ones are counted as discarded.
+        let startOffset = count > array.count ? count - array.count : 0
+        let writeCount = count - startOffset
+        var discarded = startOffset
+
+        // Drop the oldest queued samples to make room instead of refusing the
+        // block, so a producer outpacing playback keeps the newest audio rather
+        // than silently losing whole incoming chunks.
+        let overflow = writeCount - availableSpaceForWriting
+        if overflow > 0 {
+            readIndex += overflow
+            discarded += overflow
         }
 
         let writeStartIndex = writeIndex % array.count
 
-        if writeStartIndex + count <= array.count {
-            for i in 0 ..< count {
-                array[writeStartIndex + i] = block[i]
+        if writeStartIndex + writeCount <= array.count {
+            for i in 0 ..< writeCount {
+                array[writeStartIndex + i] = block[startOffset + i]
             }
         } else {
             let firstPartCount = array.count - writeStartIndex
             for i in 0 ..< firstPartCount {
-                array[writeStartIndex + i] = block[i]
+                array[writeStartIndex + i] = block[startOffset + i]
             }
-            for i in 0 ..< count - firstPartCount {
-                array[i] = block[firstPartCount + i]
+            for i in 0 ..< writeCount - firstPartCount {
+                array[i] = block[startOffset + firstPartCount + i]
             }
         }
 
-        writeIndex += count
-        return true
+        writeIndex += writeCount
+        return discarded
     }
 
     public mutating func read() -> T? {
