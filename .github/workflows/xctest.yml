@@ -8,11 +8,11 @@ name: XCTest (Swift unit tests)
 #
 # Scope note: only the macOS example has its RunnerTests target wired into its
 # Xcode project (example/macos/Runner.xcodeproj), so that is the suite executed
-# here. The RingBuffer struct under test is duplicated verbatim between the iOS
-# and macOS plugins, so the macOS run fully guards the drop-oldest invariant.
-# The iOS example currently has an orphaned RunnerTests.swift that is not added
-# to example/ios/Runner.xcodeproj and therefore cannot be run by xcodebuild
-# until that target is wired in (tracked separately — see PR #7 discussion).
+# here. RingBuffer is now a single shared Swift source compiled by both the iOS
+# and macOS plugin pods (ios/Classes/RingBuffer.swift, symlinked into
+# macos/Classes), so this one macOS run guards the only implementation there is
+# — the iOS/macOS copies can no longer drift, and the orphaned iOS RunnerTests
+# duplicate was removed.
 
 on:
   pull_request:

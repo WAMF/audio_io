@@ -21,9 +21,10 @@ class RunnerTests: XCTestCase {
 // `RingBuffer.writeBlock` (PR #7, commit 7e9956e9) was changed from
 // refuse-the-whole-block-on-overflow to drop-oldest / keep-newest. The
 // arithmetic is correct but off-by-one-prone and had zero test coverage.
-// These cases lock the invariant against future refactors. The `RingBuffer`
-// struct is duplicated verbatim in the iOS and macOS plugins, so this same
-// suite lives in both `example/ios` and `example/macos` RunnerTests.
+// These cases lock the invariant against future refactors. `RingBuffer` is now
+// a single shared Swift source compiled by both the iOS and macOS plugin pods
+// (ios/Classes/RingBuffer.swift, symlinked into macos/Classes), so this macOS
+// suite is the single XCTest gate for that one implementation.
 class RingBufferWriteBlockTests: XCTestCase {
 
   /// Drains every queued sample in read order so we can assert ordering.
@@ -101,10 +102,9 @@ class RingBufferWriteBlockTests: XCTestCase {
 // stale index would surface old samples or corrupt the next write), and the new
 // public API shipped with zero test coverage. This case locks the invariant.
 //
-// Like `RingBufferWriteBlockTests`, the `RingBuffer` struct is duplicated
-// verbatim between the iOS and macOS plugins, so this same suite lives in both
-// `example/ios` and `example/macos` RunnerTests; the macOS target is the one
-// wired into CI (see .github/workflows/xctest.yml).
+// Like `RingBufferWriteBlockTests`, this exercises the single shared
+// `RingBuffer` source compiled by both plugin pods; the macOS RunnerTests
+// target is the one wired into CI (see .github/workflows/xctest.yml).
 class RingBufferClearTests: XCTestCase {
 
   // clear() must empty the queue, and a fresh write afterwards must read back
