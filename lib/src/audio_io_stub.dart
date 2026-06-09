@@ -19,6 +19,9 @@ abstract class AudioIoImpl {
     bool allowSampleRateMismatch = false,
   });
   Future<void> stop();
+
+  /// Discards audio queued for playback but not yet rendered.
+  Future<void> clearOutput();
   Map<String, dynamic> getFormat();
   Future<void> requestFrameDuration(double duration);
   Future<double> getFrameDuration();

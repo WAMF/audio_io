@@ -277,6 +277,11 @@ class AudioIoWeb implements AudioIoImpl {
   }
 
   @override
+  Future<void> clearOutput() async {
+    _outputBuffer.clear();
+  }
+
+  @override
   Future<void> stop() async {
     if (!_isRunning) return;
 

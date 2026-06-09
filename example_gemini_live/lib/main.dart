@@ -219,8 +219,23 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
 
     final turnComplete = serverContent['turnComplete'] == true;
     final interrupted = serverContent['interrupted'] == true;
-    if (turnComplete || interrupted) {
+    if (interrupted) {
+      _handleInterruption();
+    } else if (turnComplete) {
       _resumeMicAfterPlayback();
+    }
+  }
+
+  // Gemini reports the turn was interrupted: drop everything still queued for
+  // playback so stale audio is not played over the next turn, and reopen the
+  // mic immediately rather than waiting for a drain that no longer applies.
+  void _handleInterruption() {
+    unawaited(AudioIo.instance.clearOutput());
+    _resumeMicTimer?.cancel();
+    _resumeMicTimer = null;
+    _playbackEndsAt = null;
+    if (_micSuppressed) {
+      setState(() => _micSuppressed = false);
     }
   }
 

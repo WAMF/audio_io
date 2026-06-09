@@ -11,6 +11,7 @@ import 'src/audio_io_stub.dart'
 class _Methods {
   static const start = 'start';
   static const stop = 'stop';
+  static const clearOutput = 'clearOutput';
   static const requestFrameDuration = 'requestFrameDuration';
   static const getFrameDuration = 'getFrameDuration';
   static const getFormat = 'getFormat';
@@ -292,6 +293,19 @@ class AudioIo {
     await _inputSubscription?.cancel();
     await _outputBytesSubscription?.cancel();
     await _methods.invokeMethod(_Methods.stop);
+  }
+
+  /// Discards audio queued for playback but not yet rendered.
+  ///
+  /// Use this to cut output immediately on a barge-in or when the remote peer
+  /// signals the current response was interrupted, rather than waiting for the
+  /// already-buffered audio to drain.
+  Future<void> clearOutput() async {
+    if (_impl.usePlatformImpl) {
+      await _impl.clearOutput();
+      return;
+    }
+    await _methods.invokeMethod(_Methods.clearOutput);
   }
 
   Future<Map<String, dynamic>?> getFormat() async {

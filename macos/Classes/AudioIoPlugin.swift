@@ -27,6 +27,7 @@ private enum _Constants {
 enum Methods: String {
     case start
     case stop
+    case clearOutput
     case requestFrameDuration
     case getFrameDuration
     case requestFormat
@@ -241,6 +242,9 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         case Methods.stop.rawValue:
             stop()
             result(nil)
+        case Methods.clearOutput.rawValue:
+            clearOutput()
+            result(nil)
         case Methods.requestFrameDuration.rawValue:
             if let requested = call.arguments as? Double {
                 _frameDuration = requested
@@ -259,6 +263,12 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         print("Stop Audio Engine")
         engine.stop()
         _isRunning = false
+    }
+
+    public func clearOutput() {
+        queue.async {
+            self.buffer.clear()
+        }
     }
 
     public func start() {

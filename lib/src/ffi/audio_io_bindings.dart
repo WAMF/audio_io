@@ -38,6 +38,9 @@ typedef AudioIoWritePcm16Native = Int32 Function(
 typedef AudioIoWritePcm16 = int Function(
     Pointer<Void> handle, Pointer<Int16> buffer, int frameCount);
 
+typedef AudioIoClearOutputNative = Void Function(Pointer<Void> handle);
+typedef AudioIoClearOutput = void Function(Pointer<Void> handle);
+
 typedef AudioIoGetSampleRateNative = Int32 Function(Pointer<Void> handle);
 typedef AudioIoGetSampleRate = int Function(Pointer<Void> handle);
 
@@ -75,6 +78,7 @@ class AudioIoBindings {
   late final AudioIoWrite write;
   late final AudioIoReadPcm16 readPcm16;
   late final AudioIoWritePcm16 writePcm16;
+  late final AudioIoClearOutput clearOutput;
   late final AudioIoGetSampleRate getSampleRate;
   late final AudioIoGetChannels getChannels;
   late final AudioIoGetFormat getFormat;
@@ -123,6 +127,11 @@ class AudioIoBindings {
     writePcm16 = _lib
         .lookup<NativeFunction<AudioIoWritePcm16Native>>(
             'audio_io_write_pcm16')
+        .asFunction();
+
+    clearOutput = _lib
+        .lookup<NativeFunction<AudioIoClearOutputNative>>(
+            'audio_io_clear_output')
         .asFunction();
 
     getSampleRate = _lib

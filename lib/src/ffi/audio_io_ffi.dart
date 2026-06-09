@@ -202,6 +202,11 @@ class AudioIoFFI {
     }
   }
 
+  void clearOutput() {
+    if (!_isRunning || _handle == null) return;
+    _bindings.clearOutput(_handle!);
+  }
+
   Map<String, dynamic> getFormat() {
     final sampleRate = _handle != null
         ? _bindings.getSampleRate(_handle!).toDouble()
