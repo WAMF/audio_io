@@ -92,3 +92,45 @@ class RingBufferWriteBlockTests: XCTestCase {
     XCTAssertEqual(drain(&buffer), [1, 2])
   }
 }
+
+// MARK: - RingBuffer.clear coverage (PR #7, commit 9053b63)
+//
+// `clearOutput()` flushes the OUTPUT ring buffer on a barge-in / interruption.
+// It bottoms out in `RingBuffer.clear()`, which resets `readIndex`/`writeIndex`
+// to 0 without zeroing the backing array. That reset is off-by-one-prone (a
+// stale index would surface old samples or corrupt the next write), and the new
+// public API shipped with zero test coverage. This case locks the invariant.
+//
+// Like `RingBufferWriteBlockTests`, the `RingBuffer` struct is duplicated
+// verbatim between the iOS and macOS plugins, so this same suite lives in both
+// `example/ios` and `example/macos` RunnerTests; the macOS target is the one
+// wired into CI (see .github/workflows/xctest.yml).
+class RingBufferClearTests: XCTestCase {
+
+  // clear() must empty the queue, and a fresh write afterwards must read back
+  // exactly the new samples in order — proving both indices reset cleanly and
+  // no stale data survives. Fail-if-reverted: making clear() a no-op (or
+  // breaking the readIndex/writeIndex reset) leaves the old [1,2,3] queued, so
+  // isEmpty, read()==nil, and the [9,9] read-back all fail.
+  func testRingBufferClearEmptiesOutput() {
+    var buffer = RingBuffer<Float>(count: 8)
+
+    // Queue some playback, then flush it as clearOutput() would.
+    XCTAssertEqual(buffer.writeBlock([1, 2, 3]), 0)
+    XCTAssertFalse(buffer.isEmpty, "buffer holds queued samples before clear")
+
+    buffer.clear()
+
+    XCTAssertTrue(buffer.isEmpty, "clear() must drop all queued samples")
+    XCTAssertNil(buffer.read(), "clear() must leave nothing to read")
+    XCTAssertFalse(buffer.isFull)
+
+    // A fresh write after the reset must produce exactly the new samples with
+    // no stale data and no index corruption.
+    XCTAssertEqual(buffer.writeBlock([9, 9]), 0)
+    XCTAssertEqual(buffer.read(), 9 as Float?, "first read after clear+write is the new sample")
+    XCTAssertEqual(buffer.read(), 9 as Float?, "second read after clear+write is the new sample")
+    XCTAssertNil(buffer.read(), "only the two freshly written samples are present")
+    XCTAssertTrue(buffer.isEmpty, "buffer is drained again after reading both samples")
+  }
+}
