@@ -151,13 +151,24 @@ class AudioIo {
     return null;
   }
 
-  Future<void> requestLatency(AudioIoLatency option) async {
+  Future<void> requestLatency(AudioIoLatency option) {
+    return requestFrameDuration(_presetLatency[option]!);
+  }
+
+  /// Requests an explicit frame duration in seconds.
+  ///
+  /// Besides the callback quantum, native back ends size their internal
+  /// output ring buffer from this value (duration * sampleRate * 4 frames),
+  /// so clients that queue large amounts of audio ahead of time should
+  /// request a duration big enough that the queue fits; pushed samples
+  /// that exceed the ring are dropped. Must be called before [start] to
+  /// take effect on platforms that size buffers at startup.
+  Future<void> requestFrameDuration(double seconds) async {
     if (_impl.usePlatformImpl) {
-      await _impl.requestFrameDuration(_presetLatency[option]!);
+      await _impl.requestFrameDuration(seconds);
       return;
     }
-    return _methods.invokeMethod(
-        _Methods.requestFrameDuration, _presetLatency[option]);
+    return _methods.invokeMethod(_Methods.requestFrameDuration, seconds);
   }
 
   Future<double> currentLatency() async {

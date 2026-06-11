@@ -1,3 +1,20 @@
+## 0.3.3-dev.1
+
+- Web: replaced the growable-list output queue (O(n) `removeAt(0)` per
+  sample inside the audio callback) with an O(1) `Float32List` ring buffer,
+  and replaced per-sample JS interop with bulk `copyToChannel` /
+  typed-array copies. Fixes crackling and dropouts under load.
+- Web: pushed 48 kHz audio is now linearly resampled to the actual
+  AudioContext device rate (often 44.1 kHz), fixing pitch and queue-drift
+  on devices that do not run at 48 kHz. `getFormat()` reports the device
+  rate under `output.deviceSampleRate`.
+- Web: the microphone is only requested when `input` is listened to;
+  output-only apps no longer trigger a permission prompt.
+- Web: ScriptProcessor buffer size floor raised to 2048 frames for
+  main-thread stability.
+- Added public `requestFrameDuration(double seconds)` so clients can size
+  the native output ring buffer; the latency presets now route through it.
+
 ## 0.0.1
 Kiss release
 Input from mic at fixed sample rate and buffer size, no output

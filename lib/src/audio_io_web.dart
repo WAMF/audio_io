@@ -1,12 +1,11 @@
 import 'dart:async';
 import 'dart:js_interop';
-import 'dart:js_interop_unsafe';
+import 'dart:typed_data';
+
 import 'package:web/web.dart' as web;
 
 import 'audio_io_stub.dart';
-
-@JS('window')
-external JSObject get window;
+import 'output_ring.dart';
 
 @JS('AudioContext')
 @staticInterop
@@ -63,19 +62,39 @@ class AudioBuffer {}
 
 extension AudioBufferExt on AudioBuffer {
   external JSFloat32Array getChannelData(int channel);
+  external void copyToChannel(JSFloat32Array source, int channelNumber);
   external int get length;
 }
 
+/// Web implementation backed by a ScriptProcessorNode.
+///
+/// Output samples are queued in an O(1) [OutputRing] and copied to the
+/// audio callback in bulk (no per-sample JS interop). Clients always push
+/// 48 kHz data; when the AudioContext runs at a different device rate the
+/// ring drain linearly resamples, so the contract and the real-time
+/// consumption rate (48,000 frames per second) hold on every device.
+///
+/// The microphone is only requested once [inputAudioStream] is listened
+/// to: output-only users never trigger a permission prompt.
 class AudioIoWeb implements AudioIoImpl {
+  static const double _contractSampleRate = 48000;
+
+  // ScriptProcessorNode runs on the main thread; small buffers glitch as
+  // soon as the page does any real work.
+  static const int _minBufferSize = 2048;
+  static const int _minRingFrames = 16384;
+  static const double _ringDurationMultiplier = 4;
+
   AudioContext? _audioContext;
   ScriptProcessorNode? _scriptProcessor;
   StreamController<List<double>>? _inputController;
   StreamController<List<double>>? _outputController;
-  List<double> _outputBuffer = [];
+  OutputRing _ring = OutputRing(_minRingFrames);
+  Float32List _scratch = Float32List(0);
   bool _isRunning = false;
+  bool _inputRequested = false;
   double _requestedFrameDuration = 0.003; // Default 3ms (Balanced)
-  int _bufferSize =
-      2048; // Default buffer size (matches previous hardcoded value)
+  int _bufferSize = _minBufferSize;
 
   @override
   bool get usePlatformImpl => true;
@@ -86,21 +105,27 @@ class AudioIoWeb implements AudioIoImpl {
   @override
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
 
-  // Calculate optimal buffer size based on requested frame duration
+  // ScriptProcessorNode requires a power of two between 256 and 16384;
+  // anything below 2048 glitches on the main thread.
   int _calculateBufferSize(double sampleRate) {
-    // ScriptProcessorNode requires power of 2: 256, 512, 1024, 2048, 4096, 8192, 16384
     final targetSamples = (_requestedFrameDuration * sampleRate).round();
 
-    // Find the closest power of 2
-    const validSizes = [256, 512, 1024, 2048, 4096, 8192, 16384];
+    const validSizes = [2048, 4096, 8192, 16384];
 
-    for (int size in validSizes) {
+    for (final size in validSizes) {
       if (size >= targetSamples) {
         return size;
       }
     }
 
-    return 4096; // Default fallback
+    return 16384;
+  }
+
+  int _calculateRingFrames() {
+    final requested =
+        (_requestedFrameDuration * _contractSampleRate * _ringDurationMultiplier)
+            .round();
+    return requested > _minRingFrames ? requested : _minRingFrames;
   }
 
   @override
@@ -108,7 +133,6 @@ class AudioIoWeb implements AudioIoImpl {
     if (_isRunning) return;
 
     try {
-      // Create audio context
       _audioContext = AudioContext();
 
       // Resume context if suspended (required for Chrome)
@@ -116,67 +140,67 @@ class AudioIoWeb implements AudioIoImpl {
         await _audioContext!.resume().toDart;
       }
 
-      // Calculate optimal buffer size based on sample rate and requested latency
       final sampleRate = _audioContext!.sampleRate;
       _bufferSize = _calculateBufferSize(sampleRate);
+      _ring = OutputRing(_calculateRingFrames());
+      _scratch = Float32List(_bufferSize);
 
-      // Create script processor with calculated buffer size
       // Buffer size, 1 input channel, 1 output channel
       _scriptProcessor =
           _audioContext!.createScriptProcessor(_bufferSize, 1, 1);
 
-      _inputController = StreamController<List<double>>.broadcast();
+      // Request the microphone lazily so output-only users never see a
+      // permission prompt.
+      _inputController = StreamController<List<double>>.broadcast(
+        onListen: _connectInputIfNeeded,
+      );
+
       _outputController = StreamController<List<double>>();
+      _outputController!.stream.listen(_ring.write);
 
-      // Listen for output data
-      _outputController!.stream.listen((data) {
-        _outputBuffer.addAll(data);
-      });
+      final resampleRatio = _contractSampleRate / sampleRate;
 
-      // Set up audio processing callback
       _scriptProcessor!.onaudioprocess = ((JSAny event) {
         final audioEvent = event as AudioProcessingEvent;
-        final inputBuffer = audioEvent.inputBuffer;
         final outputBuffer = audioEvent.outputBuffer;
-        final bufferLength = inputBuffer.length;
+        final frames = outputBuffer.length;
 
-        // Get input data
-        final inputData = inputBuffer.getChannelData(0);
-
-        // Convert Float32Array to Dart List
-        final inputList = <double>[];
-        for (int i = 0; i < bufferLength; i++) {
-          final value = inputData.getProperty(i.toJS) as JSNumber?;
-          inputList.add(value?.toDartDouble ?? 0.0);
+        if (_scratch.length < frames) {
+          _scratch = Float32List(frames);
         }
 
-        // Send input to stream
-        _inputController?.add(inputList);
+        _ring.readResampled(_scratch, frames, resampleRatio);
+        outputBuffer.copyToChannel(_scratch.toJS, 0);
 
-        // Get output data
-        final outputData = outputBuffer.getChannelData(0);
-
-        // Fill output buffer
-        for (int i = 0; i < bufferLength; i++) {
-          final value =
-              _outputBuffer.isNotEmpty ? _outputBuffer.removeAt(0) : 0.0;
-          outputData.setProperty(i.toJS, value.toJS);
+        final input = _inputController;
+        if (_inputRequested && input != null && input.hasListener) {
+          final inputData = audioEvent.inputBuffer.getChannelData(0).toDart;
+          input.add(List<double>.from(inputData));
         }
       }).toJS;
 
       // Connect to speakers
       _scriptProcessor!.connect(_audioContext!.destination);
 
-      // Request microphone access
-      final mediaStream = await _getUserMedia();
-      if (mediaStream != null) {
-        final source = _audioContext!.createMediaStreamSource(mediaStream);
-        source.connect(_scriptProcessor!);
-      }
-
       _isRunning = true;
+
+      if (_inputController!.hasListener) {
+        await _connectInputIfNeeded();
+      }
     } catch (e) {
       throw Exception('Failed to start audio: $e');
+    }
+  }
+
+  Future<void> _connectInputIfNeeded() async {
+    if (_inputRequested || !_isRunning) return;
+    _inputRequested = true;
+
+    final mediaStream = await _getUserMedia();
+    final context = _audioContext;
+    final processor = _scriptProcessor;
+    if (mediaStream != null && context != null && processor != null) {
+      context.createMediaStreamSource(mediaStream).connect(processor);
     }
   }
 
@@ -201,6 +225,7 @@ class AudioIoWeb implements AudioIoImpl {
     if (!_isRunning) return;
 
     _isRunning = false;
+    _inputRequested = false;
     _scriptProcessor?.disconnect();
     _scriptProcessor = null;
     await _audioContext?.close().toDart;
@@ -209,22 +234,23 @@ class AudioIoWeb implements AudioIoImpl {
     await _outputController?.close();
     _inputController = null;
     _outputController = null;
-    _outputBuffer.clear();
+    _ring.clear();
   }
 
   @override
   Map<String, dynamic> getFormat() {
-    final sampleRate = _audioContext?.sampleRate ?? 48000.0;
+    final deviceSampleRate = _audioContext?.sampleRate ?? _contractSampleRate;
     return {
       'input': {
         'type': 'double',
         'channels': 1,
-        'sampleRate': sampleRate,
+        'sampleRate': _contractSampleRate,
       },
       'output': {
         'type': 'double',
         'channels': 1,
-        'sampleRate': sampleRate,
+        'sampleRate': _contractSampleRate,
+        'deviceSampleRate': deviceSampleRate,
       },
     };
   }
@@ -242,7 +268,7 @@ class AudioIoWeb implements AudioIoImpl {
 
   @override
   Future<double> getFrameDuration() async {
-    final sampleRate = _audioContext?.sampleRate ?? 48000.0;
+    final sampleRate = _audioContext?.sampleRate ?? _contractSampleRate;
     // If not running, calculate what the buffer size would be
     final actualBufferSize =
         _isRunning ? _bufferSize : _calculateBufferSize(sampleRate);
