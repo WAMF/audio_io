@@ -1,9 +1,6 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
-
-import 'package:flutter/foundation.dart';
 import 'package:web/web.dart' as web;
 
 import 'audio_io_stub.dart';
@@ -23,14 +20,10 @@ extension AudioContextExt on AudioContext {
   external JSPromise resume();
   external JSPromise close();
   external ScriptProcessorNode createScriptProcessor(
-    int bufferSize,
-    int inputChannels,
-    int outputChannels,
-  );
+      int bufferSize, int inputChannels, int outputChannels);
   external AudioDestinationNode get destination;
   external MediaStreamAudioSourceNode createMediaStreamSource(
-    web.MediaStream stream,
-  );
+      web.MediaStream stream);
 }
 
 @JS()
@@ -74,34 +67,15 @@ extension AudioBufferExt on AudioBuffer {
 }
 
 class AudioIoWeb implements AudioIoImpl {
-  static const _pcm16FormatValue = 1;
-  // Default ScriptProcessor buffer (~42.67ms at 48kHz) when no explicit frame
-  // duration is requested, or when a request is too small for web to honour.
-  static const _defaultBufferSize = 2048;
-  // ScriptProcessorNode only accepts power-of-two buffer sizes in this range.
-  static const _minBufferSize = 256;
-  static const _maxBufferSize = 16384;
-  // Requests below this (e.g. the native 1.5–6ms latency presets) cannot be
-  // delivered reliably by the main-thread ScriptProcessor, so they fall back to
-  // the default buffer. The public `frameDurationMs` knob starts at 20ms.
-  static const _minHonouredFrameDuration = 0.02;
-
   AudioContext? _audioContext;
   ScriptProcessorNode? _scriptProcessor;
   StreamController<List<double>>? _inputController;
   StreamController<List<double>>? _outputController;
-  StreamController<Uint8List>? _inputBytesController;
-  StreamController<Uint8List>? _outputBytesController;
-  final Queue<double> _outputBuffer = Queue<double>();
+  List<double> _outputBuffer = [];
   bool _isRunning = false;
-  int _format = 0;
-  int _requestedSampleRate = 48000;
-  // Frame duration requested via requestFrameDuration(); applied at start(),
-  // where the AudioContext sample rate is known. Null until requested.
-  double? _requestedFrameDuration;
-  // Actual ScriptProcessor buffer size chosen for the running pipeline, so
-  // getFrameDuration() can report the duration the caller really gets.
-  int _activeBufferSize = _defaultBufferSize;
+  double _requestedFrameDuration = 0.003; // Default 3ms (Balanced)
+  int _bufferSize =
+      2048; // Default buffer size (matches previous hardcoded value)
 
   @override
   bool get usePlatformImpl => true;
@@ -112,168 +86,114 @@ class AudioIoWeb implements AudioIoImpl {
   @override
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
 
-  @override
-  Stream<Uint8List>? get inputBytesStream => _inputBytesController?.stream;
+  // Calculate optimal buffer size based on requested frame duration
+  int _calculateBufferSize(double sampleRate) {
+    // ScriptProcessorNode requires power of 2: 256, 512, 1024, 2048, 4096, 8192, 16384
+    final targetSamples = (_requestedFrameDuration * sampleRate).round();
 
-  @override
-  StreamSink<Uint8List>? get outputBytesSink => _outputBytesController?.sink;
+    // Find the closest power of 2
+    const validSizes = [256, 512, 1024, 2048, 4096, 8192, 16384];
 
-  @override
-  Future<void> start({
-    int sampleRate = 48000,
-    int format = 0,
-    bool allowSampleRateMismatch = false,
-  }) async {
-    if (_isRunning) {
-      // A same-config restart is a no-op; a reconfigure (different rate or
-      // format) while running would silently keep the first config, so
-      // surface it instead of swallowing it.
-      if (sampleRate != _requestedSampleRate || format != _format) {
-        throw StateError(
-          'audio_io is already started; call stop() before reconfiguring '
-          '(requested sampleRate=$sampleRate, format=$format; '
-          'current sampleRate=$_requestedSampleRate, format=$_format)',
-        );
+    for (int size in validSizes) {
+      if (size >= targetSamples) {
+        return size;
       }
-      return;
     }
-    _format = format;
-    _requestedSampleRate = sampleRate;
+
+    return 4096; // Default fallback
+  }
+
+  @override
+  Future<void> start() async {
+    if (_isRunning) return;
 
     try {
+      // Create audio context
       _audioContext = AudioContext();
-      final actualRate = _audioContext!.sampleRate.toInt();
-      if (sampleRate != actualRate) {
-        // The browser controls the AudioContext rate; it cannot be forced.
-        // Proceeding silently would emit `actualRate` audio mislabelled as
-        // `sampleRate` (e.g. 48 kHz sent to a 16 kHz Gemini Live endpoint),
-        // producing aliased / wrong-speed audio with no surfaced error.
-        // Fail loudly unless the caller has explicitly opted in.
-        if (!allowSampleRateMismatch) {
-          await _audioContext!.close().toDart;
-          _audioContext = null;
-          throw StateError(
-            'Web AudioContext runs at ${actualRate}Hz but ${sampleRate}Hz '
-            'was requested. The browser controls this rate and it cannot be '
-            'changed. Either request ${actualRate}Hz (see getFormat()), '
-            'resample on your side, or pass '
-            'allowSampleRateMismatch: true to accept ${actualRate}Hz audio.',
-          );
-        }
-        debugPrint(
-          'Warning: Web AudioContext runs at ${actualRate}Hz, '
-          'requested ${sampleRate}Hz. Audio will use ${actualRate}Hz.',
-        );
-      }
 
+      // Resume context if suspended (required for Chrome)
       if (_audioContext!.state == 'suspended') {
         await _audioContext!.resume().toDart;
       }
 
-      _activeBufferSize = _resolveBufferSize(_audioContext!.sampleRate);
-      _scriptProcessor = _audioContext!.createScriptProcessor(
-        _activeBufferSize,
-        1,
-        1,
-      );
+      // Calculate optimal buffer size based on sample rate and requested latency
+      final sampleRate = _audioContext!.sampleRate;
+      _bufferSize = _calculateBufferSize(sampleRate);
+
+      // Create script processor with calculated buffer size
+      // Buffer size, 1 input channel, 1 output channel
+      _scriptProcessor =
+          _audioContext!.createScriptProcessor(_bufferSize, 1, 1);
 
       _inputController = StreamController<List<double>>.broadcast();
       _outputController = StreamController<List<double>>();
-      _inputBytesController = StreamController<Uint8List>.broadcast();
-      _outputBytesController = StreamController<Uint8List>();
 
-      if (_format == _pcm16FormatValue) {
-        _outputBytesController!.stream.listen((bytes) {
-          _outputBuffer.addAll(_pcm16LeToFloat32(bytes));
-        });
-      } else {
-        _outputController!.stream.listen((data) {
-          _outputBuffer.addAll(data);
-        });
-      }
+      // Listen for output data
+      _outputController!.stream.listen((data) {
+        _outputBuffer.addAll(data);
+      });
 
+      // Set up audio processing callback
       _scriptProcessor!.onaudioprocess = ((JSAny event) {
         final audioEvent = event as AudioProcessingEvent;
         final inputBuffer = audioEvent.inputBuffer;
         final outputBuffer = audioEvent.outputBuffer;
-
         final bufferLength = inputBuffer.length;
 
+        // Get input data
         final inputData = inputBuffer.getChannelData(0);
+
+        // Convert Float32Array to Dart List
         final inputList = <double>[];
         for (int i = 0; i < bufferLength; i++) {
           final value = inputData.getProperty(i.toJS) as JSNumber?;
           inputList.add(value?.toDartDouble ?? 0.0);
         }
 
-        if (_format == _pcm16FormatValue) {
-          _inputBytesController?.add(_float32ListToPcm16Le(inputList));
-        } else {
-          _inputController?.add(inputList);
-        }
+        // Send input to stream
+        _inputController?.add(inputList);
 
+        // Get output data
         final outputData = outputBuffer.getChannelData(0);
+
+        // Fill output buffer
         for (int i = 0; i < bufferLength; i++) {
-          final value = _outputBuffer.isNotEmpty
-              ? _outputBuffer.removeFirst()
-              : 0.0;
+          final value =
+              _outputBuffer.isNotEmpty ? _outputBuffer.removeAt(0) : 0.0;
           outputData.setProperty(i.toJS, value.toJS);
         }
       }).toJS;
 
+      // Connect to speakers
       _scriptProcessor!.connect(_audioContext!.destination);
 
-      // _getUserMedia() throws on permission/device failure. Letting it
-      // propagate means a denied mic surfaces as a startup error rather than a
-      // "successful" start with permanently silent input.
+      // Request microphone access
       final mediaStream = await _getUserMedia();
-      final source = _audioContext!.createMediaStreamSource(mediaStream);
-      source.connect(_scriptProcessor!);
+      if (mediaStream != null) {
+        final source = _audioContext!.createMediaStreamSource(mediaStream);
+        source.connect(_scriptProcessor!);
+      }
 
       _isRunning = true;
     } catch (e) {
-      // Any failure between AudioContext creation and a fully-running pipeline
-      // (sample-rate mismatch, mic acquisition, etc.) must leave no half-open
-      // context/processor/controllers behind and keep _isRunning false.
-      await _teardownAfterFailedStart();
       throw Exception('Failed to start audio: $e');
     }
   }
 
-  Future<web.MediaStream> _getUserMedia() async {
+  Future<web.MediaStream?> _getUserMedia() async {
     try {
-      final constraints = web.MediaStreamConstraints(audio: true.toJS);
+      final constraints = web.MediaStreamConstraints(
+        audio: true.toJS,
+      );
 
       final stream = await web.window.navigator.mediaDevices
           .getUserMedia(constraints)
           .toDart;
       return stream;
     } catch (e) {
-      debugPrint('Failed to get user media: $e');
-      throw StateError(
-        'Microphone access failed (permission denied or no input device): $e',
-      );
+      // Failed to get user media
+      return null;
     }
-  }
-
-  Future<void> _teardownAfterFailedStart() async {
-    _isRunning = false;
-
-    _scriptProcessor?.disconnect();
-    _scriptProcessor = null;
-
-    await _audioContext?.close().toDart;
-    _audioContext = null;
-
-    await _inputController?.close();
-    await _outputController?.close();
-    await _inputBytesController?.close();
-    await _outputBytesController?.close();
-    _inputController = null;
-    _outputController = null;
-    _inputBytesController = null;
-    _outputBytesController = null;
-    _outputBuffer.clear();
   }
 
   @override
@@ -281,88 +201,54 @@ class AudioIoWeb implements AudioIoImpl {
     if (!_isRunning) return;
 
     _isRunning = false;
-
     _scriptProcessor?.disconnect();
     _scriptProcessor = null;
-
     await _audioContext?.close().toDart;
     _audioContext = null;
-
     await _inputController?.close();
     await _outputController?.close();
-    await _inputBytesController?.close();
-    await _outputBytesController?.close();
     _inputController = null;
     _outputController = null;
-    _inputBytesController = null;
-    _outputBytesController = null;
     _outputBuffer.clear();
   }
 
   @override
   Map<String, dynamic> getFormat() {
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
-    final type = _format == _pcm16FormatValue ? 'pcm16' : 'double';
-
     return {
-      'input': {'type': type, 'channels': 1, 'sampleRate': sampleRate},
-      'output': {'type': type, 'channels': 1, 'sampleRate': sampleRate},
+      'input': {
+        'type': 'double',
+        'channels': 1,
+        'sampleRate': sampleRate,
+      },
+      'output': {
+        'type': 'double',
+        'channels': 1,
+        'sampleRate': sampleRate,
+      },
     };
   }
 
   @override
   Future<void> requestFrameDuration(double duration) async {
-    // The Web Audio ScriptProcessorNode buffer size is fixed at creation, so
-    // the request is recorded here and applied in start() once the
-    // AudioContext sample rate is known. Read back via getFrameDuration().
     _requestedFrameDuration = duration;
+
+    // If already running, restart with new buffer size
+    if (_isRunning) {
+      await stop();
+      await start();
+    }
   }
 
   @override
   Future<double> getFrameDuration() async {
     final sampleRate = _audioContext?.sampleRate ?? 48000.0;
-    return _activeBufferSize / sampleRate;
-  }
+    // If not running, calculate what the buffer size would be
+    final actualBufferSize =
+        _isRunning ? _bufferSize : _calculateBufferSize(sampleRate);
 
-  /// Maps a requested frame duration to a ScriptProcessorNode buffer size.
-  ///
-  /// The Web Audio API only accepts power-of-two buffers in
-  /// [`_minBufferSize`, `_maxBufferSize`]. An explicit `frameDurationMs`
-  /// request (>= 20ms) is honoured by picking the nearest valid buffer size;
-  /// the sub-10ms native latency presets — which the main-thread
-  /// ScriptProcessor cannot deliver — fall back to the default buffer.
-  int _resolveBufferSize(double sampleRate) {
-    final requested = _requestedFrameDuration;
-    if (requested == null || requested < _minHonouredFrameDuration) {
-      return _defaultBufferSize;
-    }
-    final idealSamples = requested * sampleRate;
-    var best = _minBufferSize;
-    for (var size = _minBufferSize; size <= _maxBufferSize; size *= 2) {
-      if ((size - idealSamples).abs() < (best - idealSamples).abs()) {
-        best = size;
-      }
-    }
-    return best;
+    return actualBufferSize / sampleRate;
   }
-}
-
-Uint8List _float32ListToPcm16Le(List<double> samples) {
-  final bytes = ByteData(samples.length * 2);
-  for (var i = 0; i < samples.length; i++) {
-    final clamped = samples[i].clamp(-1.0, 1.0);
-    bytes.setInt16(i * 2, (clamped * 32767).round(), Endian.little);
-  }
-  return bytes.buffer.asUint8List();
-}
-
-List<double> _pcm16LeToFloat32(Uint8List bytes) {
-  final data = ByteData.sublistView(bytes);
-  final samples = List<double>.filled(bytes.length ~/ 2, 0.0);
-  for (var i = 0; i < samples.length; i++) {
-    samples[i] = data.getInt16(i * 2, Endian.little) / 32767.0;
-  }
-  return samples;
 }
 
 AudioIoImpl createAudioIoImpl() => AudioIoWeb();
