@@ -1,5 +1,12 @@
 ## 0.3.3-dev.1
 
+- Web: output now plays through an `AudioWorkletNode` when available. The
+  worklet owns a ring buffer drained on the dedicated audio rendering
+  thread, so main-thread jank (heavy frames, GC pauses) can no longer
+  glitch playback. Pushed 48 kHz audio is resampled to the device rate on
+  the push path before being posted to the worklet. Browsers without
+  AudioWorklet fall back to the ScriptProcessor path below; microphone
+  input continues to use a (lazy, input-only) ScriptProcessorNode.
 - Web: replaced the growable-list output queue (O(n) `removeAt(0)` per
   sample inside the audio callback) with an O(1) `Float32List` ring buffer,
   and replaced per-sample JS interop with bulk `copyToChannel` /
