@@ -99,7 +99,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     var _binaryMessenger: FlutterBinaryMessenger?
     var _frameDuration = _Constants.defaultFrameDuration
     var _sampleRate = _Constants.preferedSampleRate
-    var buffer = RingBuffer<Double>(count: 0)
+    var buffer = AudioOutputRing(minimumCapacity: 2048)
     let maxFrameJitter = _Constants.defaultMaxFrameJitter
     let queue = DispatchQueue(label: _Constants.processingQueueName)
     var _isRunning = false
@@ -123,16 +123,10 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             renderBlock: { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
                 guard let self = self else { return noErr }
                 let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                self.queue.sync {
-                    for buffer in ablPointer {
-                        let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(
-                            buffer)
-                        var i = 0
-                        while i < frameCount {
-                            buf[i] = self.buffer.read() ?? 0
-                            i += 1
-                        }
-                    }
+                for buffer in ablPointer {
+                    let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(
+                        buffer)
+                    self.buffer.read(into: buf, count: Int(frameCount))
                 }
                 return noErr
             })
@@ -183,16 +177,8 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                     return
                 }
                 autoreleasepool {
-                    instance.queue.sync {
-                        let count = data.count / MemoryLayout<Double>.stride
-                        data.withUnsafeBytes { rawPtr in
-                            let doubles = rawPtr.bindMemory(to: Double.self)
-                            for i in 0..<count {
-                                if !instance.buffer.write(doubles[i]) {
-                                    break
-                                }
-                            }
-                        }
+                    data.withUnsafeBytes { rawPtr in
+                        instance.buffer.write(rawPtr.bindMemory(to: Double.self))
                     }
                 }
             })
@@ -222,10 +208,10 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                     do {
                         try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(
                             _frameDuration)
-                        buffer = RingBuffer<Double>(
-                            count: max(
-                                _Constants.ringBufferSize,
-                                Int(_frameDuration * _sampleRate * maxFrameJitter)))
+                        buffer = AudioOutputRing(
+                minimumCapacity: max(
+                    _Constants.ringBufferSize,
+                    Int(_frameDuration * _sampleRate * maxFrameJitter)))
                     } catch {
                     }
                 }
@@ -280,9 +266,10 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     private func startInternal() throws {
-        buffer = RingBuffer<Double>(
-            count: max(
-                _Constants.ringBufferSize, Int(_frameDuration * _sampleRate * maxFrameJitter)))
+        buffer = AudioOutputRing(
+                minimumCapacity: max(
+                    _Constants.ringBufferSize,
+                    Int(_frameDuration * _sampleRate * maxFrameJitter)))
 
         let expectedFrameSize = Int(_frameDuration * _sampleRate)
         let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
@@ -404,87 +391,77 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     }
 }
 
-public struct RingBuffer<T> {
-    fileprivate var array: [T?]
-    fileprivate var readIndex = 0
-    fileprivate var writeIndex = 0
 
-    public init(count: Int) {
-        array = [T?](repeating: nil, count: count)
+
+/// Single-producer single-consumer ring buffer for the audio output path.
+///
+/// Fixed power-of-two storage of plain Doubles, monotonic 64-bit indices
+/// (no wrap accounting to get wrong), and an os_unfair_lock - which donates
+/// priority to the holder, unlike a DispatchQueue - held only for short
+/// bulk copies, so the realtime render thread never waits on descheduled
+/// main-thread work.
+final class AudioOutputRing {
+    private let storage: UnsafeMutablePointer<Double>
+    private let capacity: Int
+    private let mask: Int
+    private var head = 0  // total samples written
+    private var tail = 0  // total samples read
+    private let lockPtr: UnsafeMutablePointer<os_unfair_lock>
+
+    init(minimumCapacity: Int) {
+        var cap = 2048
+        while cap < minimumCapacity { cap <<= 1 }
+        capacity = cap
+        mask = cap - 1
+        storage = UnsafeMutablePointer<Double>.allocate(capacity: cap)
+        storage.initialize(repeating: 0, count: cap)
+        lockPtr = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lockPtr.initialize(to: os_unfair_lock())
     }
 
-    public mutating func write(_ element: T) -> Bool {
-        if !isFull {
-            array[writeIndex % array.count] = element
-            writeIndex = (writeIndex + 1) % (array.count * 2)
-            return true
-        } else {
-            return false
-        }
+    deinit {
+        storage.deallocate()
+        lockPtr.deallocate()
     }
 
-    public mutating func writeBlock(_ block: [T?]) -> Bool {
-        let count = block.count
-        guard availableSpaceForWriting >= count else {
-            return false
+    /// Writes as many samples as fit; the excess is dropped.
+    @discardableResult
+    func write(_ samples: UnsafeBufferPointer<Double>) -> Int {
+        os_unfair_lock_lock(lockPtr)
+        let free = capacity - (head - tail)
+        let accepted = min(samples.count, free)
+        var index = head
+        for i in 0..<accepted {
+            storage[index & mask] = samples[i]
+            index += 1
         }
-
-        let writeStartIndex = writeIndex % array.count
-
-        if writeStartIndex + count <= array.count {
-            array.replaceSubrange(writeStartIndex..<writeStartIndex + count, with: block)
-        } else {
-            let firstPartCount = array.count - writeStartIndex
-            array.replaceSubrange(
-                writeStartIndex..<writeStartIndex + firstPartCount, with: block[..<firstPartCount])
-            array.replaceSubrange(0..<count - firstPartCount, with: block[firstPartCount...])
-        }
-
-        writeIndex = (writeIndex + count) % (array.count * 2)
-        return true
+        head = index
+        os_unfair_lock_unlock(lockPtr)
+        return accepted
     }
 
-    public mutating func read() -> T? {
-        if !isEmpty {
-            let element = array[readIndex % array.count]
-            readIndex = (readIndex + 1) % (array.count * 2)
-            return element
-        } else {
-            return nil
+    /// Fills [out] with up to [count] samples; the shortfall is zero-filled.
+    func read(into out: UnsafeMutableBufferPointer<Double>, count: Int) {
+        os_unfair_lock_lock(lockPtr)
+        let available = min(count, head - tail)
+        var index = tail
+        for i in 0..<available {
+            out[i] = storage[index & mask]
+            index += 1
         }
-    }
-
-    public mutating func readBlock(count: Int) -> [T?]? {
-        if availableSpaceForReading >= count {
-            var result = [T?](repeating: nil, count: count)
-            for i in 0..<count {
-                result[i] = array[(readIndex + i) % array.count]
+        tail = index
+        os_unfair_lock_unlock(lockPtr)
+        if available < count {
+            for i in available..<count {
+                out[i] = 0
             }
-            readIndex = (readIndex + count) % (array.count * 2)
-            return result
         }
-        return nil
     }
 
-    public mutating func clear() {
-        readIndex = 0
-        writeIndex = 0
-    }
-
-    fileprivate var availableSpaceForReading: Int {
-        return writeIndex - readIndex
-    }
-
-    public var isEmpty: Bool {
-        return availableSpaceForReading == 0
-    }
-
-    fileprivate var availableSpaceForWriting: Int {
-        return array.count - availableSpaceForReading
-    }
-
-    public var isFull: Bool {
-        return availableSpaceForWriting == 0
+    func clear() {
+        os_unfair_lock_lock(lockPtr)
+        tail = head
+        os_unfair_lock_unlock(lockPtr)
     }
 }
 
