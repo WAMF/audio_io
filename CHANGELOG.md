@@ -1,5 +1,20 @@
 ## 0.3.3-dev.1
 
+- macOS/iOS: the output source node is now pinned to the 48 kHz mono
+  Float64 contract format instead of inheriting the INPUT device's sample
+  rate. Previously, Bluetooth routes (44.1 kHz A2DP output, 16-24 kHz HFP
+  microphone) made 48 kHz content play slow and pitched down while the
+  ring buffer overflowed (periodic crackles); AVAudioEngine now converts
+  to the hardware rate and always consumes 48,000 frames/s. `getFormat()`
+  reports the real device rate under `output.deviceSampleRate`. The ring
+  is sized from the contract rate on every path (it previously shrank
+  after route changes), `requestFrameDuration` while running restarts the
+  engine instead of swapping the ring under the live render thread, the
+  iOS session preferred rate no longer drifts to the last input rate, the
+  input buffer pool is sized after the device rate is known and guarded
+  by `os_unfair_lock` instead of a render-thread `DispatchQueue.sync`,
+  and the engine-reconfiguration observer is scoped to this plugin's
+  engine.
 - Web: concurrent `start()` calls now share one start attempt (the web
   fires a lifecycle resume on every window focus, which could race a
   widget-init start into two AudioContexts and a `StateError` on the

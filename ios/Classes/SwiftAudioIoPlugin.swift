@@ -15,6 +15,11 @@ extension Data {
 
 enum _Constants {
     static let preferedSampleRate = 48000.0
+    /// Clients always push mono Float64 at this rate; the source node is
+    /// pinned to it and AVAudioEngine converts to the hardware rate, so
+    /// Bluetooth (44.1 kHz A2DP, 16-24 kHz HFP input) and other devices
+    /// play at correct speed while the engine keeps consuming 48 k/s.
+    static let outputContractSampleRate = 48000.0
     static let workspaceSamples = 100_000
     static let defaultFrameDuration = 0.003  // (3ms)
     static let defaultMaxFrameJitter = 4.0
@@ -53,6 +58,7 @@ enum AudioDataTypes: String {
 }
 
 enum _AudioFormat {
+    static let deviceSampleRate = "deviceSampleRate"
     static let sampleRate = "sampleRate"
     static let dataType = "type"
     static let channels = "channels"
@@ -60,35 +66,44 @@ enum _AudioFormat {
     static let output = "output"
 }
 
+/// Guarded by os_unfair_lock (priority donating, no allocation) because
+/// acquire() runs on the realtime render thread; a serial DispatchQueue
+/// there can block the audio callback behind a descheduled worker.
 class DataBufferPool {
     private var pool: [Data] = []
     private let bufferSize: Int
     private let poolSize: Int
-    private let queue = DispatchQueue(label: "DataBufferPool")
+    private let lockPtr: UnsafeMutablePointer<os_unfair_lock>
 
     init(bufferSize: Int, poolSize: Int = 8) {
         self.bufferSize = bufferSize
         self.poolSize = poolSize
+        lockPtr = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lockPtr.initialize(to: os_unfair_lock())
         for _ in 0..<poolSize {
             pool.append(Data(count: bufferSize))
         }
     }
 
+    deinit {
+        lockPtr.deinitialize(count: 1)
+        lockPtr.deallocate()
+    }
+
     func acquire() -> Data {
-        return queue.sync {
-            if pool.isEmpty {
-                return Data(count: bufferSize)
-            }
-            return pool.removeLast()
+        os_unfair_lock_lock(lockPtr)
+        defer { os_unfair_lock_unlock(lockPtr) }
+        if pool.isEmpty {
+            return Data(count: bufferSize)
         }
+        return pool.removeLast()
     }
 
     func release(_ data: Data) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            if self.pool.count < self.poolSize {
-                self.pool.append(data)
-            }
+        os_unfair_lock_lock(lockPtr)
+        defer { os_unfair_lock_unlock(lockPtr) }
+        if pool.count < poolSize {
+            pool.append(data)
         }
     }
 }
@@ -116,7 +131,8 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
 
     private func createSourceNode() -> AVAudioSourceNode {
         let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat64, sampleRate: _sampleRate, channels: 1,
+            commonFormat: .pcmFormatFloat64,
+            sampleRate: _Constants.outputContractSampleRate, channels: 1,
             interleaved: false)!
         return AVAudioSourceNode(
             format: format,
@@ -185,7 +201,8 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
 
         NotificationCenter.default.addObserver(
             instance, selector: #selector(handleConfigChange),
-            name: NSNotification.Name.AVAudioEngineConfigurationChange, object: nil)
+            name: NSNotification.Name.AVAudioEngineConfigurationChange,
+            object: instance.engine)
         NotificationCenter.default.addObserver(
             instance, selector: #selector(handleRouteChange),
             name: AVAudioSession.routeChangeNotification, object: nil)
@@ -208,10 +225,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                     do {
                         try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(
                             _frameDuration)
-                        buffer = AudioOutputRing(
-                minimumCapacity: max(
-                    _Constants.ringBufferSize,
-                    Int(_frameDuration * _sampleRate * maxFrameJitter)))
+                        resetAudio()
                     } catch {
                     }
                 }
@@ -269,18 +283,19 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         buffer = AudioOutputRing(
                 minimumCapacity: max(
                     _Constants.ringBufferSize,
-                    Int(_frameDuration * _sampleRate * maxFrameJitter)))
-
-        let expectedFrameSize = Int(_frameDuration * _sampleRate)
-        let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
-        bufferPool = DataBufferPool(bufferSize: bufferSize, poolSize: 8)
+                    Int(_frameDuration * _Constants.outputContractSampleRate
+                        * maxFrameJitter)))
 
         try AVAudioSession.sharedInstance().setCategory(
             .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
         try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
-        try AVAudioSession.sharedInstance().setPreferredSampleRate(_sampleRate)
+        try AVAudioSession.sharedInstance().setPreferredSampleRate(_Constants.preferedSampleRate)
 
         try setupPipelineIfNeeded()
+
+        let expectedFrameSize = Int(_frameDuration * _sampleRate)
+        let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
+        bufferPool = DataBufferPool(bufferSize: bufferSize, poolSize: 8)
 
         inputConverter.outputVolume = 1.0
 
@@ -384,7 +399,8 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         let outputDesc: [String: Any] = [
             _AudioFormat.dataType: AudioDataTypes.double.rawValue,
             _AudioFormat.channels: 1,
-            _AudioFormat.sampleRate: _sampleRate,
+            _AudioFormat.sampleRate: _Constants.outputContractSampleRate,
+            _AudioFormat.deviceSampleRate: engine.outputNode.outputFormat(forBus: 0).sampleRate,
         ]
 
         return [_AudioFormat.input: inputDesc, _AudioFormat.output: outputDesc]
