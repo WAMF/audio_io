@@ -164,6 +164,7 @@ class AudioIoWeb implements AudioIoImpl {
   static const String _workletProcessorName = 'audio-io-output';
 
   AudioContext? _audioContext;
+  Future<void>? _startInFlight;
   AudioWorkletNodeJs? _workletNode;
   String? _workletUrl;
   ScriptProcessorNode? _scriptProcessor;
@@ -208,8 +209,17 @@ class AudioIoWeb implements AudioIoImpl {
     return requested > _minRingFrames ? requested : _minRingFrames;
   }
 
+  /// Concurrent calls share one start attempt: the web fires a lifecycle
+  /// resume on every window focus, which raced widget-init starts into
+  /// two AudioContexts (and a StateError on the second output listen).
   @override
-  Future<void> start() async {
+  Future<void> start() {
+    if (_isRunning) return Future.value();
+    return _startInFlight ??=
+        _startOnce().whenComplete(() => _startInFlight = null);
+  }
+
+  Future<void> _startOnce() async {
     if (_isRunning) return;
 
     try {
@@ -368,6 +378,14 @@ class AudioIoWeb implements AudioIoImpl {
 
   @override
   Future<void> stop() async {
+    final inFlight = _startInFlight;
+    if (inFlight != null) {
+      try {
+        await inFlight;
+      } on Exception {
+        // The start attempt failed; nothing is running to stop.
+      }
+    }
     if (!_isRunning) return;
 
     _isRunning = false;
@@ -398,6 +416,11 @@ class AudioIoWeb implements AudioIoImpl {
         'channels': 1,
         'sampleRate': _contractSampleRate,
         'deviceSampleRate': deviceSampleRate,
+        'backend': _workletNode != null
+            ? 'audioWorklet'
+            : _scriptProcessor != null
+                ? 'scriptProcessor'
+                : 'inactive',
       },
     };
   }

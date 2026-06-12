@@ -1,5 +1,11 @@
 ## 0.3.3-dev.1
 
+- Web: concurrent `start()` calls now share one start attempt (the web
+  fires a lifecycle resume on every window focus, which could race a
+  widget-init start into two AudioContexts and a `StateError` on the
+  second output listen); `stop()` waits for an in-flight start before
+  tearing down. `getFormat()` reports which output path is active under
+  `output.backend` (`audioWorklet` / `scriptProcessor` / `inactive`).
 - Web: output now plays through an `AudioWorkletNode` when available. The
   worklet owns a ring buffer drained on the dedicated audio rendering
   thread, so main-thread jank (heavy frames, GC pauses) can no longer
