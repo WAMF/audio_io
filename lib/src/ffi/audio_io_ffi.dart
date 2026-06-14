@@ -156,7 +156,7 @@ class AudioIoFFI {
 
   Future<void> requestFrameDuration(double duration) async {
     _requestedFrameDuration = duration;
-    if (_handle != null && _isRunning) {
+    if (_handle != null) {
       _bindings.setFrameDuration(_handle!, duration);
     }
   }

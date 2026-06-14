@@ -1,0 +1,14 @@
+.dart_tool/
+.packages
+build/
+.env
+*.env
+pubspec.lock
+ios/
+android/
+macos/
+web/
+linux/
+windows/
+.flutter-plugins
+.flutter-plugins-dependencies

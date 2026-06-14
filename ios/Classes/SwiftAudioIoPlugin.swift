@@ -15,10 +15,16 @@ extension Data {
 
 enum _Constants {
     static let preferedSampleRate = 48000.0
+    /// Clients always push mono Float64 at this rate; the source node is
+    /// pinned to it and AVAudioEngine converts to the hardware rate, so
+    /// Bluetooth (44.1 kHz A2DP, 16-24 kHz HFP input) and other devices
+    /// play at correct speed while the engine keeps consuming 48 k/s.
+    static let outputContractSampleRate = 48000.0
     static let workspaceSamples = 100_000
-    static let defaultFrameDuration = 0.003 // (3ms)
+    static let defaultFrameDuration = 0.003  // (3ms)
     static let defaultMaxFrameJitter = 4.0
     static let processingQueueName = "SwiftAudioIoPluginQueue"
+    static let ringBufferSize = 2048
 }
 
 enum Methods: String {
@@ -28,6 +34,15 @@ enum Methods: String {
     case getFrameDuration
     case requestFormat
     case getFormat
+}
+
+enum AudioIoError {
+    static let permissionDeniedCode = "MICROPHONE_PERMISSION_DENIED"
+    static let permissionDeniedMessage = "Microphone permission not granted. This plugin requires microphone access to function. Please request microphone permission using a package like permission_handler before calling start()."
+    static let audioSessionCode = "AUDIO_SESSION_ERROR"
+    static let audioSessionMessage = "Failed to configure audio session"
+    static let engineStartCode = "ENGINE_START_ERROR"
+    static let engineStartMessage = "Failed to start audio engine"
 }
 
 enum Channels: String {
@@ -43,11 +58,54 @@ enum AudioDataTypes: String {
 }
 
 enum _AudioFormat {
+    static let deviceSampleRate = "deviceSampleRate"
     static let sampleRate = "sampleRate"
     static let dataType = "type"
     static let channels = "channels"
     static let input = "input"
     static let output = "output"
+}
+
+/// Guarded by os_unfair_lock (priority donating, no allocation) because
+/// acquire() runs on the realtime render thread; a serial DispatchQueue
+/// there can block the audio callback behind a descheduled worker.
+class DataBufferPool {
+    private var pool: [Data] = []
+    private let bufferSize: Int
+    private let poolSize: Int
+    private let lockPtr: UnsafeMutablePointer<os_unfair_lock>
+
+    init(bufferSize: Int, poolSize: Int = 8) {
+        self.bufferSize = bufferSize
+        self.poolSize = poolSize
+        lockPtr = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lockPtr.initialize(to: os_unfair_lock())
+        for _ in 0..<poolSize {
+            pool.append(Data(count: bufferSize))
+        }
+    }
+
+    deinit {
+        lockPtr.deinitialize(count: 1)
+        lockPtr.deallocate()
+    }
+
+    func acquire() -> Data {
+        os_unfair_lock_lock(lockPtr)
+        defer { os_unfair_lock_unlock(lockPtr) }
+        if pool.isEmpty {
+            return Data(count: bufferSize)
+        }
+        return pool.removeLast()
+    }
+
+    func release(_ data: Data) {
+        os_unfair_lock_lock(lockPtr)
+        defer { os_unfair_lock_unlock(lockPtr) }
+        if pool.count < poolSize {
+            pool.append(data)
+        }
+    }
 }
 
 public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
@@ -56,80 +114,121 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     var _binaryMessenger: FlutterBinaryMessenger?
     var _frameDuration = _Constants.defaultFrameDuration
     var _sampleRate = _Constants.preferedSampleRate
-    var buffer = RingBuffer<Double>(count: 0)
+    var buffer = AudioOutputRing(minimumCapacity: 2048)
     let maxFrameJitter = _Constants.defaultMaxFrameJitter
     let queue = DispatchQueue(label: _Constants.processingQueueName)
     var _isRunning = false
     var _isPipelineSetup = false
     var _resetting = false
+    var bufferPool: DataBufferPool?
 
     private var sourceNode: AVAudioSourceNode?
 
-    private func createSourceNode() -> AVAudioSourceNode {
-        let format = AVAudioFormat(commonFormat: .pcmFormatFloat64, sampleRate: _sampleRate, channels: 1, interleaved: false)!
-        return AVAudioSourceNode(format: format, renderBlock: { _, _, frameCount, audioBufferList -> OSStatus in
-            let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            self.queue.sync {
-                for buffer in ablPointer {
-                    let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(buffer)
-                    var i = 0
-                    while i < frameCount {
-                        buf[i] = self.buffer.read() ?? 0
-                        i += 1
-                    }
-                }
-            }
-            return noErr
-        })
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        engine.stop()
     }
 
-    private lazy var sinkNode = AVAudioSinkNode { _, frames, audioBufferList ->
-        OSStatus in
+    private func createSourceNode() -> AVAudioSourceNode {
+        let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat64,
+            sampleRate: _Constants.outputContractSampleRate, channels: 1,
+            interleaved: false)!
+        return AVAudioSourceNode(
+            format: format,
+            renderBlock: { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
+                guard let self = self else { return noErr }
+                let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
+                for buffer in ablPointer {
+                    let buf: UnsafeMutableBufferPointer<Double> = UnsafeMutableBufferPointer(
+                        buffer)
+                    self.buffer.read(into: buf, count: Int(frameCount))
+                }
+                return noErr
+            })
+    }
+
+    private lazy var sinkNode = AVAudioSinkNode { [weak self] _, frames, audioBufferList -> OSStatus in
+        guard let self = self else { return noErr }
         let sampleCount = Int(frames)
-        var doubleSamples = [Double](repeating: 0.0, count: sampleCount)
-        let ptr = audioBufferList.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self)
-        let unsafePtr = UnsafeBufferPointer(start: ptr, count: sampleCount)
-        var i = 0
-        while i < sampleCount {
-            doubleSamples[i] = Double(unsafePtr[i])
-            i += 1
+        guard let ptr = audioBufferList.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self) else {
+            return noErr
         }
-        let data = Data(fromArray: doubleSamples)
-        self._binaryMessenger?.send(onChannel: Channels.inputChannelName.rawValue, message: data)
+
+        let byteCount = sampleCount * MemoryLayout<Double>.stride
+        var doubleData = self.bufferPool?.acquire() ?? Data(count: byteCount)
+
+        if doubleData.count != byteCount {
+            doubleData = Data(count: byteCount)
+        }
+
+        doubleData.withUnsafeMutableBytes { doublePtr in
+            let doubles = doublePtr.bindMemory(to: Double.self)
+            for i in 0..<sampleCount {
+                doubles[i] = Double(ptr[i])
+            }
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self._binaryMessenger?.send(
+                onChannel: Channels.inputChannelName.rawValue, message: doubleData,
+                binaryReply: { [weak self] _ in
+                    self?.bufferPool?.release(doubleData)
+                })
+        }
         return noErr
     }
 
     public static func register(with registrar: FlutterPluginRegistrar) {
-        let channel = FlutterMethodChannel(name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger())
+        let channel = FlutterMethodChannel(
+            name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger())
         let instance = SwiftAudioIoPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
         instance._binaryMessenger = registrar.messenger()
-        instance._binaryMessenger?.setMessageHandlerOnChannel(Channels.outputChannelName.rawValue, binaryMessageHandler: { data, _ in
-            guard let data = data else {
-                return
-            }
-            instance.queue.async {
-                let doubles: [Double] = data.toArray(type: Double.self)
-                _ = instance.buffer.writeBlock(doubles)
-            }
-        })
+        instance._binaryMessenger?.setMessageHandlerOnChannel(
+            Channels.outputChannelName.rawValue,
+            binaryMessageHandler: { [weak instance] data, _ in
+                guard let data = data, let instance = instance else {
+                    return
+                }
+                autoreleasepool {
+                    data.withUnsafeBytes { rawPtr in
+                        instance.buffer.write(rawPtr.bindMemory(to: Double.self))
+                    }
+                }
+            })
 
-        NotificationCenter.default.addObserver(instance, selector: #selector(handleConfigChange), name: NSNotification.Name.AVAudioEngineConfigurationChange, object: nil)
-        NotificationCenter.default.addObserver(instance, selector: #selector(handleRouteChange), name: AVAudioSession.routeChangeNotification, object: nil)
-        NotificationCenter.default.addObserver(instance, selector: #selector(handleInterruption), name: AVAudioSession.interruptionNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            instance, selector: #selector(handleConfigChange),
+            name: NSNotification.Name.AVAudioEngineConfigurationChange,
+            object: instance.engine)
+        NotificationCenter.default.addObserver(
+            instance, selector: #selector(handleRouteChange),
+            name: AVAudioSession.routeChangeNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            instance, selector: #selector(handleInterruption),
+            name: AVAudioSession.interruptionNotification, object: nil)
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case Methods.start.rawValue:
-            start()
-            result(nil)
+            start(result: result)
         case Methods.stop.rawValue:
             stop()
             result(nil)
         case Methods.requestFrameDuration.rawValue:
             if let requested = call.arguments as? Double {
                 _frameDuration = requested
+                if _isRunning {
+                    do {
+                        try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(
+                            _frameDuration)
+                        resetAudio()
+                    } catch {
+                    }
+                }
             }
             result(nil)
         case Methods.getFrameDuration.rawValue:
@@ -142,46 +241,70 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     public func stop() {
-        print("Stop Audio Engine")
         engine.stop()
         _isRunning = false
+        buffer.clear()
     }
 
-    public func start() {
-        print("Start Audio Engine")
-        buffer = RingBuffer<Double>(count: Int(_frameDuration * _sampleRate * maxFrameJitter))
-        // Setup AVAudioSession
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
-            try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
-            try AVAudioSession.sharedInstance().setPreferredSampleRate(_sampleRate)
-        } catch {
-            print("Session config Error")
+    public func start(result: @escaping FlutterResult) {
+        let permissionStatus = AVAudioSession.sharedInstance().recordPermission
+
+        switch permissionStatus {
+        case .denied:
+            result(FlutterError(
+                code: AudioIoError.permissionDeniedCode,
+                message: AudioIoError.permissionDeniedMessage,
+                details: nil))
             return
+        case .undetermined:
+            result(FlutterError(
+                code: AudioIoError.permissionDeniedCode,
+                message: AudioIoError.permissionDeniedMessage,
+                details: nil))
+            return
+        case .granted:
+            break
+        @unknown default:
+            break
         }
 
-        // Connect nodes
         do {
-            try setupPipelineIfNeeded()
-        } catch {
-            print("Audio pipeline error \(error)")
-            return
+            try startInternal()
+            result(nil)
+        } catch let error as NSError {
+            result(FlutterError(
+                code: error.domain,
+                message: error.localizedDescription,
+                details: nil))
         }
+    }
+
+    private func startInternal() throws {
+        buffer = AudioOutputRing(
+                minimumCapacity: max(
+                    _Constants.ringBufferSize,
+                    Int(_frameDuration * _Constants.outputContractSampleRate
+                        * maxFrameJitter)))
+
+        try AVAudioSession.sharedInstance().setCategory(
+            .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
+        try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
+        try AVAudioSession.sharedInstance().setPreferredSampleRate(_Constants.preferedSampleRate)
+
+        try setupPipelineIfNeeded()
+
+        let expectedFrameSize = Int(_frameDuration * _sampleRate)
+        let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
+        bufferPool = DataBufferPool(bufferSize: bufferSize, poolSize: 8)
 
         inputConverter.outputVolume = 1.0
 
-        // Start engine
-        do {
-            try engine.start()
-            _isRunning = true
-        } catch {
-            print("Audio start error")
-        }
+        try engine.start()
+        _isRunning = true
     }
 
     public func setupPipelineIfNeeded() throws {
         if !_isPipelineSetup {
-            print("setupPipeline")
             // Setup engine and node instances
             let input = engine.inputNode
             let output = engine.mainMixerNode
@@ -190,7 +313,9 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             inputConverter.outputVolume = 1.0
             // Connect nodes
             let sourceNode = createSourceNode()
-            let processingformat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1, interleaved: false)
+            let processingformat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1,
+                interleaved: false)
             engine.attach(inputConverter)
             engine.attach(sinkNode)
             engine.attach(sourceNode)
@@ -199,12 +324,10 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             engine.connect(sourceNode, to: output, format: nil)
             self.sourceNode = sourceNode
             _isPipelineSetup = true
-            print("setupPipeline complete")
         }
     }
 
     public func detachPipeline() {
-        print("detachPipeline")
         engine.detach(inputConverter)
         engine.detach(sinkNode)
         if let sourceNode = sourceNode {
@@ -214,166 +337,156 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     @objc func handleConfigChange(notification _: NSNotification) {
-        print("handleConfigChange:")
         resetAudio()
     }
 
     @objc func handleInterruption(notification: NSNotification) {
         guard let userInfo = notification.userInfo,
-              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: typeValue),
-              _isRunning
+            let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: typeValue),
+            _isRunning
         else {
             return
         }
         switch type {
         case .began:
-            print("handleInterruption: began")
+            break
         case .ended:
-            print("handleInterruption: ended")
+            break
         default: ()
         }
     }
 
     @objc func handleRouteChange(notification: NSNotification) {
         guard let userInfo = notification.userInfo,
-              let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
-              let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
+            let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
+            let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
         else {
             return
         }
         switch reason {
         case .newDeviceAvailable:
-            print("newDeviceAvailable:")
+            break
         case .oldDeviceUnavailable:
-            print("oldDeviceAvailable:")
+            break
         case .routeConfigurationChange:
-            print("routeConfigurationChange:")
+            break
         case .categoryChange:
-            print("routeConfigurationChange:")
+            break
         default: ()
-            print("handleRouteChange:")
-            print(reasonValue)
         }
     }
 
     public func resetAudio() {
         if _isRunning && !_resetting {
             _resetting = true
-            print("Resetting Audio Engine")
             engine.stop()
             detachPipeline()
             DispatchQueue.main.async {
-                self.start()
+                try? self.startInternal()
                 self._resetting = false
             }
         }
     }
 
     public func getFormat() -> [String: Any] {
-        let inputDesc: [String: Any] = [_AudioFormat.dataType: AudioDataTypes.double.rawValue,
-                                        _AudioFormat.channels: 1,
-                                        _AudioFormat.sampleRate: _sampleRate]
+        let inputDesc: [String: Any] = [
+            _AudioFormat.dataType: AudioDataTypes.double.rawValue,
+            _AudioFormat.channels: 1,
+            _AudioFormat.sampleRate: _sampleRate,
+        ]
 
-        let outputDesc: [String: Any] = [_AudioFormat.dataType: AudioDataTypes.double.rawValue,
-                                         _AudioFormat.channels: 1,
-                                         _AudioFormat.sampleRate: _sampleRate]
+        let outputDesc: [String: Any] = [
+            _AudioFormat.dataType: AudioDataTypes.double.rawValue,
+            _AudioFormat.channels: 1,
+            _AudioFormat.sampleRate: _Constants.outputContractSampleRate,
+            _AudioFormat.deviceSampleRate: engine.outputNode.outputFormat(forBus: 0).sampleRate,
+        ]
 
         return [_AudioFormat.input: inputDesc, _AudioFormat.output: outputDesc]
     }
 }
 
-public struct RingBuffer<T> {
-    fileprivate var array: [T?]
-    fileprivate var readIndex = 0
-    fileprivate var writeIndex = 0
 
-    public init(count: Int) {
-        array = [T?](repeating: nil, count: count)
+
+/// Single-producer single-consumer ring buffer for the audio output path.
+///
+/// Fixed power-of-two storage of plain Doubles, monotonic 64-bit indices
+/// (no wrap accounting to get wrong), and an os_unfair_lock - which donates
+/// priority to the holder, unlike a DispatchQueue - held only for short
+/// bulk copies, so the realtime render thread never waits on descheduled
+/// main-thread work.
+final class AudioOutputRing {
+    private let storage: UnsafeMutablePointer<Double>
+    private let capacity: Int
+    private let mask: Int
+    private var head = 0  // total samples written
+    private var tail = 0  // total samples read
+    private let lockPtr: UnsafeMutablePointer<os_unfair_lock>
+
+    init(minimumCapacity: Int) {
+        var cap = 2048
+        while cap < minimumCapacity { cap <<= 1 }
+        capacity = cap
+        mask = cap - 1
+        storage = UnsafeMutablePointer<Double>.allocate(capacity: cap)
+        storage.initialize(repeating: 0, count: cap)
+        lockPtr = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lockPtr.initialize(to: os_unfair_lock())
     }
 
-    public mutating func write(_ element: T) -> Bool {
-        if !isFull {
-            array[writeIndex % array.count] = element
-            writeIndex += 1
-            return true
-        } else {
-            return false
-        }
+    deinit {
+        storage.deallocate()
+        lockPtr.deallocate()
     }
 
-    public mutating func writeBlock(_ block: [T?]) -> Bool {
-        let count = block.count
-        guard availableSpaceForWriting >= count else {
-            return false
+    /// Writes as many samples as fit; the excess is dropped.
+    @discardableResult
+    func write(_ samples: UnsafeBufferPointer<Double>) -> Int {
+        os_unfair_lock_lock(lockPtr)
+        let free = capacity - (head - tail)
+        let accepted = min(samples.count, free)
+        var index = head
+        for i in 0..<accepted {
+            storage[index & mask] = samples[i]
+            index += 1
         }
-
-        let writeStartIndex = writeIndex % array.count
-
-        if writeStartIndex + count <= array.count {
-            // Block fits entirely without wrapping around
-            array.replaceSubrange(writeStartIndex ..< writeStartIndex + count, with: block)
-        } else {
-            // Block wraps around the end of the buffer
-            let firstPartCount = array.count - writeStartIndex
-            array.replaceSubrange(writeStartIndex ..< writeStartIndex + firstPartCount, with: block[..<firstPartCount])
-            array.replaceSubrange(0 ..< count - firstPartCount, with: block[firstPartCount...])
-        }
-
-        writeIndex += count
-        return true
+        head = index
+        os_unfair_lock_unlock(lockPtr)
+        return accepted
     }
 
-    public mutating func read() -> T? {
-        if !isEmpty {
-            let element = array[readIndex % array.count]
-            readIndex += 1
-            return element
-        } else {
-            return nil
+    /// Fills [out] with up to [count] samples; the shortfall is zero-filled.
+    func read(into out: UnsafeMutableBufferPointer<Double>, count: Int) {
+        os_unfair_lock_lock(lockPtr)
+        let available = min(count, head - tail)
+        var index = tail
+        for i in 0..<available {
+            out[i] = storage[index & mask]
+            index += 1
         }
-    }
-
-    public mutating func readBlock(count: Int) -> [T?]? {
-        if availableSpaceForReading >= count {
-            var result = [T?](repeating: nil, count: count)
-            for i in 0 ..< count {
-                result[i] = array[(readIndex + i) % array.count]
+        tail = index
+        os_unfair_lock_unlock(lockPtr)
+        if available < count {
+            for i in available..<count {
+                out[i] = 0
             }
-            readIndex += count
-            return result
         }
-        return nil
     }
 
-    public mutating func clear() {
-        readIndex = 0
-        writeIndex = 0
-    }
-
-    fileprivate var availableSpaceForReading: Int {
-        return writeIndex - readIndex
-    }
-
-    public var isEmpty: Bool {
-        return availableSpaceForReading == 0
-    }
-
-    fileprivate var availableSpaceForWriting: Int {
-        return array.count - availableSpaceForReading
-    }
-
-    public var isFull: Bool {
-        return availableSpaceForWriting == 0
+    func clear() {
+        os_unfair_lock_lock(lockPtr)
+        tail = head
+        os_unfair_lock_unlock(lockPtr)
     }
 }
 
-public extension Double {
-    static var random: Double {
+extension Double {
+    public static var random: Double {
         return Double(arc4random()) / 0xFFFF_FFFF
     }
 
-    static func random(min: Double, max: Double) -> Double {
+    public static func random(min: Double, max: Double) -> Double {
         return Double.random * (max - min) + min
     }
 }

@@ -15,6 +15,23 @@ class _Methods {
   static const getFormat = 'getFormat';
 }
 
+class _ErrorCodes {
+  static const microphonePermissionDenied = 'MICROPHONE_PERMISSION_DENIED';
+}
+
+class AudioIoException implements Exception {
+  AudioIoException(this.code, this.message, [this.details]);
+
+  final String code;
+  final String message;
+  final dynamic details;
+
+  bool get isPermissionDenied => code == _ErrorCodes.microphonePermissionDenied;
+
+  @override
+  String toString() => 'AudioIoException($code): $message';
+}
+
 class _Channels {
   static const methodChannelName = 'com.wearemobilefirst.audio_io';
   static const audioInput = 'com.wearemobilefirst.audio_io.inputAudio';
@@ -56,9 +73,10 @@ class AudioIo {
   final _impl = impl.createAudioIoImpl();
 
   StreamController<List<double>> _outputController =
-      StreamController<List<double>>.broadcast();
+      StreamController<List<double>>.broadcast(sync: true);
   StreamController<List<double>> _inputController =
-      StreamController<List<double>>.broadcast();
+      StreamController<List<double>>.broadcast(sync: true);
+
 
   Stream<List<double>> get input {
     if (_impl.usePlatformImpl) {
@@ -67,9 +85,11 @@ class AudioIo {
     return _inputController.stream;
   }
 
+  static final _fallbackController = StreamController<List<double>>();
+
   Sink<List<double>> get output {
     if (_impl.usePlatformImpl) {
-      return _impl.outputAudioStream ?? StreamController<List<double>>().sink;
+      return _impl.outputAudioStream ?? _fallbackController.sink;
     }
     return _outputController.sink;
   }
@@ -80,26 +100,32 @@ class AudioIo {
       return;
     }
 
-    // Original method channel implementation for iOS/macOS
     _outputSubscription?.cancel();
     _inputSubscription?.cancel();
     _outputSubscription = _outputController.stream.listen((output) {
-      final outData = ByteData.view(Float64List.fromList(output).buffer);
+      final buffer =
+          output is Float64List ? output : Float64List.fromList(output);
+      final outData = ByteData.view(buffer.buffer);
       ServicesBinding.instance.defaultBinaryMessenger
           .send(_Channels.audioOutput, outData);
     });
     ServicesBinding.instance.defaultBinaryMessenger.setMessageHandler(
       _Channels.audioInput,
       (ByteData? message) {
-        if (message != null) {
-          final audioFrame = message.buffer.asFloat64List(message.offsetInBytes,
+        if (message != null && _inputController.hasListener) {
+          final view = message.buffer.asFloat64List(message.offsetInBytes,
               message.lengthInBytes ~/ _Constants.bytesPerSample);
-          _inputController.sink.add(audioFrame);
+          final copy = Float64List.fromList(view);
+          _inputController.sink.add(copy);
         }
         return null;
       },
     );
-    return _methods.invokeMethod(_Methods.start);
+    try {
+      await _methods.invokeMethod(_Methods.start);
+    } on PlatformException catch (e) {
+      throw AudioIoException(e.code, e.message ?? 'Unknown error', e.details);
+    }
   }
 
   Future<void> stop() async {
@@ -107,6 +133,10 @@ class AudioIo {
       await _impl.stop();
       return;
     }
+    _outputSubscription?.cancel();
+    _outputSubscription = null;
+    ServicesBinding.instance.defaultBinaryMessenger
+        .setMessageHandler(_Channels.audioInput, null);
     await _methods.invokeMethod(_Methods.stop);
   }
 
@@ -121,13 +151,24 @@ class AudioIo {
     return null;
   }
 
-  Future<void> requestLatency(AudioIoLatency option) async {
+  Future<void> requestLatency(AudioIoLatency option) {
+    return requestFrameDuration(_presetLatency[option]!);
+  }
+
+  /// Requests an explicit frame duration in seconds.
+  ///
+  /// Besides the callback quantum, native back ends size their internal
+  /// output ring buffer from this value (duration * sampleRate * 4 frames),
+  /// so clients that queue large amounts of audio ahead of time should
+  /// request a duration big enough that the queue fits; pushed samples
+  /// that exceed the ring are dropped. Must be called before [start] to
+  /// take effect on platforms that size buffers at startup.
+  Future<void> requestFrameDuration(double seconds) async {
     if (_impl.usePlatformImpl) {
-      await _impl.requestFrameDuration(_presetLatency[option]!);
+      await _impl.requestFrameDuration(seconds);
       return;
     }
-    return _methods.invokeMethod(
-        _Methods.requestFrameDuration, _presetLatency[option]);
+    return _methods.invokeMethod(_Methods.requestFrameDuration, seconds);
   }
 
   Future<double> currentLatency() async {
