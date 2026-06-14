@@ -1,4 +1,4 @@
-## 0.3.3-dev.1
+## 0.3.3
 
 - macOS/iOS: the output source node is now pinned to the 48 kHz mono
   Float64 contract format instead of inheriting the INPUT device's sample
