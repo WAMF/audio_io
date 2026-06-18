@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'audio_io_stub.dart';
 import 'ffi/audio_io_ffi.dart';
@@ -19,21 +18,9 @@ class AudioIoNative implements AudioIoImpl {
   StreamSink<List<double>>? get outputAudioStream => _ffi?.outputAudioStream;
 
   @override
-  Stream<Uint8List>? get inputBytesStream => _ffi?.inputBytesStream;
-
-  @override
-  StreamSink<Uint8List>? get outputBytesSink => _ffi?.outputBytesSink;
-
-  @override
-  Future<void> start({
-    int sampleRate = 48000,
-    int format = 0,
-    // Native backends negotiate [sampleRate] with the device, so the
-    // web-only mismatch flag does not apply here.
-    bool allowSampleRateMismatch = false,
-  }) async {
+  Future<void> start() async {
     _ffi = AudioIoFFI.instance;
-    await _ffi!.start(sampleRate: sampleRate, format: format);
+    await _ffi!.start();
   }
 
   @override

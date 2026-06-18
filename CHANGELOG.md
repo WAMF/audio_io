@@ -1,3 +1,48 @@
+## 0.3.3
+
+- macOS/iOS: the output source node is now pinned to the 48 kHz mono
+  Float64 contract format instead of inheriting the INPUT device's sample
+  rate. Previously, Bluetooth routes (44.1 kHz A2DP output, 16-24 kHz HFP
+  microphone) made 48 kHz content play slow and pitched down while the
+  ring buffer overflowed (periodic crackles); AVAudioEngine now converts
+  to the hardware rate and always consumes 48,000 frames/s. `getFormat()`
+  reports the real device rate under `output.deviceSampleRate`. The ring
+  is sized from the contract rate on every path (it previously shrank
+  after route changes), `requestFrameDuration` while running restarts the
+  engine instead of swapping the ring under the live render thread, the
+  iOS session preferred rate no longer drifts to the last input rate, the
+  input buffer pool is sized after the device rate is known and guarded
+  by `os_unfair_lock` instead of a render-thread `DispatchQueue.sync`,
+  and the engine-reconfiguration observer is scoped to this plugin's
+  engine.
+- Web: concurrent `start()` calls now share one start attempt (the web
+  fires a lifecycle resume on every window focus, which could race a
+  widget-init start into two AudioContexts and a `StateError` on the
+  second output listen); `stop()` waits for an in-flight start before
+  tearing down. `getFormat()` reports which output path is active under
+  `output.backend` (`audioWorklet` / `scriptProcessor` / `inactive`).
+- Web: output now plays through an `AudioWorkletNode` when available. The
+  worklet owns a ring buffer drained on the dedicated audio rendering
+  thread, so main-thread jank (heavy frames, GC pauses) can no longer
+  glitch playback. Pushed 48 kHz audio is resampled to the device rate on
+  the push path before being posted to the worklet. Browsers without
+  AudioWorklet fall back to the ScriptProcessor path below; microphone
+  input continues to use a (lazy, input-only) ScriptProcessorNode.
+- Web: replaced the growable-list output queue (O(n) `removeAt(0)` per
+  sample inside the audio callback) with an O(1) `Float32List` ring buffer,
+  and replaced per-sample JS interop with bulk `copyToChannel` /
+  typed-array copies. Fixes crackling and dropouts under load.
+- Web: pushed 48 kHz audio is now linearly resampled to the actual
+  AudioContext device rate (often 44.1 kHz), fixing pitch and queue-drift
+  on devices that do not run at 48 kHz. `getFormat()` reports the device
+  rate under `output.deviceSampleRate`.
+- Web: the microphone is only requested when `input` is listened to;
+  output-only apps no longer trigger a permission prompt.
+- Web: ScriptProcessor buffer size floor raised to 2048 frames for
+  main-thread stability.
+- Added public `requestFrameDuration(double seconds)` so clients can size
+  the native output ring buffer; the latency presets now route through it.
+
 ## 0.0.1
 Kiss release
 Input from mic at fixed sample rate and buffer size, no output
@@ -112,3 +157,76 @@ Platform Support:
 - Web ✅ (Web Audio API)
 - Linux ✅ (FFI/miniaudio)
 - Windows ✅ (FFI/miniaudio)
+
+## 0.3.2
+Bug Fix
+- Fixed compile error in resetAudio() caused by start() signature change
+
+## 0.3.1
+Performance, Stability & Error Handling Update
+
+Permission Handling:
+- Added graceful error handling when microphone permission is not granted (iOS/macOS)
+- Plugin now throws AudioIoException with clear message instead of crashing
+- Added AudioIoException class with isPermissionDenied helper for easy error handling
+- Permission errors clearly state that permission handling is the app's responsibility
+
+Threading Fix:
+- Fixed critical threading crash on macOS where platform channel messages were sent from audio thread
+- Binary messages now dispatched to main thread before sending to Flutter (iOS/macOS)
+
+API Additions:
+- Added AudioIoException class for typed error handling
+- AudioIoException.isPermissionDenied getter for checking permission errors
+- AudioIoException includes code, message, and optional details
+
+Critical Memory Leak Fixes:
+- Implemented buffer pool for Data objects to eliminate real-time allocations in audio callbacks (iOS/macOS)
+- Fixed catastrophic memory leak from DispatchQueue.main.async accumulation in audio callbacks (iOS/macOS)
+- Fixed memory accumulation from queue.async in output message handler by switching to sync (iOS/macOS)
+- Added autoreleasepool to audio callbacks and message handlers to ensure immediate memory release (iOS/macOS)
+- Fixed retain cycle in plugin instance preventing deallocation (iOS/macOS)
+- Fixed retain cycles in audio node callbacks by using weak self references (iOS/macOS)
+- Fixed NotificationCenter observer leak by adding proper deinit cleanup (iOS/macOS)
+- Fixed ByteData reference chain leak by copying audio data instead of creating views
+- Fixed ring buffer index overflow that would cause eventual corruption
+- Fixed StreamController memory leak in Dart output sink fallback
+- Added proper cleanup of binary message handlers on stop
+- Added buffer.clear() on stop to release memory immediately
+- Optimized audio buffer conversion to reduce allocations per frame
+- Made stream controllers synchronous to prevent event queue buildup
+- Optimized Dart input processing to skip allocations when no listener present
+- Eliminated Data array allocation in output handler by writing directly from buffer (iOS/macOS)
+
+Performance Improvements:
+- Optimized audio pipeline to use Float64 throughout iOS/macOS, eliminating unnecessary Float32→Float64 conversions
+- Removed unnecessary thread dispatch from audio callbacks, eliminating unbounded queue growth
+- Removed expensive DateTime operations from per-frame Dart message handler
+- Reduced CPU overhead by eliminating Float32→Float64 conversion in audio processing
+- Optimized buffer sizes based on latency mode (256-4096 samples)
+- Improved thread synchronization for audio callbacks
+- Optimized Dart output stream to avoid unnecessary Float64List allocations
+- Eliminated per-frame List allocations in example app audio processing
+- Minimized per-frame allocations in Dart message handler for better throughput
+
+Bug Fixes:
+- Fixed critical pipeline setup bug in iOS/macOS (_isPipelineSetup flag now properly set)
+- Fixed audio format mismatch crash on iOS/macOS (AVAudioEngine Float32 compatibility)
+- Fixed latency change handling on miniaudio platforms (now properly restarts with new buffer)
+- Fixed Web platform getFrameDuration calculation before audio start
+- Fixed example app pubspec.yaml formatting issues
+- Added missing flutter_lints dependency to example app
+
+Platform Improvements:
+- Added clipping protection for miniaudio platforms (Linux/Windows/Android) to prevent audio distortion
+- Implemented dynamic latency switching without restart on all platforms
+- Fixed Web platform buffer size configuration based on latency settings
+- Improved ring buffer size management with minimum size guarantee
+
+Code Quality:
+- Fixed analyzer warnings and applied dart fix recommendations
+- Removed debug print statements from production code
+- Disabled latency dropdown in example app when audio is running
+
+Diagnostics:
+- Added ring buffer overflow detection with logging (iOS/macOS)

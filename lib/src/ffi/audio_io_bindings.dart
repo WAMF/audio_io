@@ -4,11 +4,6 @@ import 'dart:io';
 typedef AudioIoCreateNative = Pointer<Void> Function();
 typedef AudioIoCreate = Pointer<Void> Function();
 
-typedef AudioIoCreateWithConfigNative = Pointer<Void> Function(
-    Double frameDuration, Int32 sampleRate, Int32 format);
-typedef AudioIoCreateWithConfig = Pointer<Void> Function(
-    double frameDuration, int sampleRate, int format);
-
 typedef AudioIoDestroyNative = Void Function(Pointer<Void> handle);
 typedef AudioIoDestroy = void Function(Pointer<Void> handle);
 
@@ -17,6 +12,9 @@ typedef AudioIoStart = int Function(Pointer<Void> handle);
 
 typedef AudioIoStopNative = Int32 Function(Pointer<Void> handle);
 typedef AudioIoStop = int Function(Pointer<Void> handle);
+
+typedef AudioIoClearOutputNative = Void Function(Pointer<Void> handle);
+typedef AudioIoClearOutput = void Function(Pointer<Void> handle);
 
 typedef AudioIoReadNative = Int32 Function(
     Pointer<Void> handle, Pointer<Double> buffer, Int32 frameCount);
@@ -28,27 +26,11 @@ typedef AudioIoWriteNative = Int32 Function(
 typedef AudioIoWrite = int Function(
     Pointer<Void> handle, Pointer<Double> buffer, int frameCount);
 
-typedef AudioIoReadPcm16Native = Int32 Function(
-    Pointer<Void> handle, Pointer<Int16> buffer, Int32 frameCount);
-typedef AudioIoReadPcm16 = int Function(
-    Pointer<Void> handle, Pointer<Int16> buffer, int frameCount);
-
-typedef AudioIoWritePcm16Native = Int32 Function(
-    Pointer<Void> handle, Pointer<Int16> buffer, Int32 frameCount);
-typedef AudioIoWritePcm16 = int Function(
-    Pointer<Void> handle, Pointer<Int16> buffer, int frameCount);
-
-typedef AudioIoClearOutputNative = Void Function(Pointer<Void> handle);
-typedef AudioIoClearOutput = void Function(Pointer<Void> handle);
-
 typedef AudioIoGetSampleRateNative = Int32 Function(Pointer<Void> handle);
 typedef AudioIoGetSampleRate = int Function(Pointer<Void> handle);
 
 typedef AudioIoGetChannelsNative = Int32 Function(Pointer<Void> handle);
 typedef AudioIoGetChannels = int Function(Pointer<Void> handle);
-
-typedef AudioIoGetFormatNative = Int32 Function(Pointer<Void> handle);
-typedef AudioIoGetFormat = int Function(Pointer<Void> handle);
 
 typedef AudioIoGetAvailableReadFramesNative = Int32 Function(
     Pointer<Void> handle);
@@ -70,18 +52,14 @@ class AudioIoBindings {
   late final DynamicLibrary _lib;
 
   late final AudioIoCreate create;
-  late final AudioIoCreateWithConfig createWithConfig;
   late final AudioIoDestroy destroy;
   late final AudioIoStart start;
   late final AudioIoStop stop;
+  late final AudioIoClearOutput clearOutput;
   late final AudioIoRead read;
   late final AudioIoWrite write;
-  late final AudioIoReadPcm16 readPcm16;
-  late final AudioIoWritePcm16 writePcm16;
-  late final AudioIoClearOutput clearOutput;
   late final AudioIoGetSampleRate getSampleRate;
   late final AudioIoGetChannels getChannels;
-  late final AudioIoGetFormat getFormat;
   late final AudioIoGetAvailableReadFrames getAvailableReadFrames;
   late final AudioIoGetAvailableWriteSpace getAvailableWriteSpace;
   late final AudioIoSetFrameDuration setFrameDuration;
@@ -92,11 +70,6 @@ class AudioIoBindings {
 
     create = _lib
         .lookup<NativeFunction<AudioIoCreateNative>>('audio_io_create')
-        .asFunction();
-
-    createWithConfig = _lib
-        .lookup<NativeFunction<AudioIoCreateWithConfigNative>>(
-            'audio_io_create_with_config')
         .asFunction();
 
     destroy = _lib
@@ -111,27 +84,17 @@ class AudioIoBindings {
         .lookup<NativeFunction<AudioIoStopNative>>('audio_io_stop')
         .asFunction();
 
+    clearOutput = _lib
+        .lookup<NativeFunction<AudioIoClearOutputNative>>(
+            'audio_io_clear_output')
+        .asFunction();
+
     read = _lib
         .lookup<NativeFunction<AudioIoReadNative>>('audio_io_read')
         .asFunction();
 
     write = _lib
         .lookup<NativeFunction<AudioIoWriteNative>>('audio_io_write')
-        .asFunction();
-
-    readPcm16 = _lib
-        .lookup<NativeFunction<AudioIoReadPcm16Native>>(
-            'audio_io_read_pcm16')
-        .asFunction();
-
-    writePcm16 = _lib
-        .lookup<NativeFunction<AudioIoWritePcm16Native>>(
-            'audio_io_write_pcm16')
-        .asFunction();
-
-    clearOutput = _lib
-        .lookup<NativeFunction<AudioIoClearOutputNative>>(
-            'audio_io_clear_output')
         .asFunction();
 
     getSampleRate = _lib
@@ -142,11 +105,6 @@ class AudioIoBindings {
     getChannels = _lib
         .lookup<NativeFunction<AudioIoGetChannelsNative>>(
             'audio_io_get_channels')
-        .asFunction();
-
-    getFormat = _lib
-        .lookup<NativeFunction<AudioIoGetFormatNative>>(
-            'audio_io_get_format')
         .asFunction();
 
     getAvailableReadFrames = _lib
