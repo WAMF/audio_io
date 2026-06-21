@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -146,8 +145,14 @@ class AudioIo {
   ///
   /// Active after [startWith] with [AudioIoFormat.pcm16]. Decoded and
   /// resampled to the engine's 48 kHz contract before reaching [output].
+  ///
+  /// Broadcast (like [inputBytes]) so the adapter can re-listen across a
+  /// stop -> startWith restart; a single-subscription controller threw
+  /// `Bad state: Stream has already been listened to` on the second
+  /// startWith because teardown cancels the subscription but keeps the
+  /// controller.
   Sink<Uint8List> get outputBytes =>
-      (_outputBytesController ??= StreamController<Uint8List>()).sink;
+      (_outputBytesController ??= StreamController<Uint8List>.broadcast()).sink;
 
 
   Stream<List<double>> get input {
@@ -225,7 +230,7 @@ class AudioIo {
     _inputResampler = PushResampler(inputRate, streamRate);
 
     final outputBytesController =
-        _outputBytesController ??= StreamController<Uint8List>();
+        _outputBytesController ??= StreamController<Uint8List>.broadcast();
     await _outputBytesSubscription?.cancel();
     _outputBytesSubscription = outputBytesController.stream.listen((bytes) {
       final samples = pcm16BytesToFloat64(bytes);
@@ -260,6 +265,15 @@ class AudioIo {
     _inputResampler = null;
     _outputResampler = null;
   }
+
+  /// Wires the PCM16 byte adapters in isolation, without starting the native
+  /// engine. Exposed only so tests can exercise the wire/teardown/re-wire
+  /// lifecycle (a real [startWith] requires native FFI that unit tests cannot
+  /// initialise). Both [_wirePcm16Adapters] and [stop] are no-ops on the
+  /// native handle when the engine has not been started.
+  @visibleForTesting
+  Future<void> wirePcm16AdaptersForTest(int streamRate) =>
+      _wirePcm16Adapters(streamRate);
 
   Future<void> stop() async {
     await _teardownPcm16Adapters();
