@@ -1,0 +1,72 @@
+name: XCTest (Swift unit tests)
+
+# Runs the native Swift XCTest suites for the example apps so regression locks
+# like RingBufferWriteBlockTests (PR #7) are actually compiled and executed in
+# CI. The repo's existing checks (CodeQL "Analyze", CodeRabbit) never build or
+# run the XCTest targets, so a green PR previously did NOT prove the Swift tests
+# pass — they only ran on a developer's machine. This workflow closes that gap.
+#
+# Scope note: only the macOS example has its RunnerTests target wired into its
+# Xcode project (example/macos/Runner.xcodeproj), so that is the suite executed
+# here. The RingBuffer struct under test is duplicated verbatim between the iOS
+# and macOS plugins, so the macOS run fully guards the drop-oldest invariant.
+# The iOS example currently has an orphaned RunnerTests.swift that is not added
+# to example/ios/Runner.xcodeproj and therefore cannot be run by xcodebuild
+# until that target is wired in (tracked separately — see PR #7 discussion).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: xctest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-xctest:
+    name: macOS RunnerTests (xcodebuild test)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Print toolchain versions
+        run: |
+          flutter --version
+          xcodebuild -version
+
+      - name: Resolve Dart/Flutter dependencies
+        working-directory: example
+        run: flutter pub get
+
+      # --config-only generates the ephemeral Flutter-Generated.xcconfig and
+      # runs `pod install`, producing the Runner.xcworkspace that xcodebuild
+      # needs — without doing a full (slow) app build.
+      - name: Configure macOS project (generates workspace + pods)
+        working-directory: example
+        run: flutter build macos --config-only
+
+      # -only-testing forces the RingBuffer suite to run. If the RunnerTests
+      # target were ever dropped from the scheme, xcodebuild fails loudly here
+      # instead of silently reporting a green "0 tests" run.
+      - name: Run macOS XCTest suite
+        working-directory: example/macos
+        run: |
+          xcodebuild test \
+            -workspace Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            -only-testing:RunnerTests \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO

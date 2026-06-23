@@ -110,6 +110,11 @@ class AudioIoOutput extends AudioWorkletProcessor {
     this.tail = 0;
     this.port.onmessage = (e) => {
       const d = e.data;
+      if (d === 'clear') {
+        this.head = 0;
+        this.tail = 0;
+        return;
+      }
       const free = this.capacity - (this.head - this.tail);
       const n = Math.min(d.length, free);
       for (let i = 0; i < n; i++) {
@@ -374,6 +379,12 @@ class AudioIoWeb implements AudioIoImpl {
       // Failed to get user media
       return null;
     }
+  }
+
+  @override
+  Future<void> clearOutput() async {
+    _ring.clear();
+    _workletNode?.port.postMessage('clear'.toJS);
   }
 
   @override

@@ -30,6 +30,7 @@ enum _Constants {
 enum Methods: String {
     case start
     case stop
+    case clearOutput
     case requestFrameDuration
     case getFrameDuration
     case requestFormat
@@ -209,6 +210,9 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             start(result: result)
         case Methods.stop.rawValue:
             stop()
+            result(nil)
+        case Methods.clearOutput.rawValue:
+            buffer.clear()
             result(nil)
         case Methods.requestFrameDuration.rawValue:
             if let requested = call.arguments as? Double {

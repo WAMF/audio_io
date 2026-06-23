@@ -29,6 +29,11 @@ class AudioIoNative implements AudioIoImpl {
   }
 
   @override
+  Future<void> clearOutput() async {
+    _ffi?.clearOutput();
+  }
+
+  @override
   Map<String, dynamic> getFormat() {
     return _ffi?.getFormat() ??
         {

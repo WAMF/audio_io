@@ -1,9 +1,12 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:audio_io/audio_io.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 void main() {
@@ -29,7 +32,7 @@ class GeminiLiveApp extends StatelessWidget {
 enum _ConnectionState { disconnected, connecting, connected, error }
 
 class _GeminiConfig {
-  static const model = 'models/gemini-2.0-flash-live';
+  static const model = 'models/gemini-3.1-flash-live-preview';
   static const voiceName = 'Puck';
   static const inputMimeType = 'audio/pcm;rate=16000';
   static const wsBaseUrl =
@@ -45,6 +48,11 @@ class _SampleRates {
 
 class _Playback {
   static const bytesPerSecond = _SampleRates.input * 2;
+
+  // Extra grace added to the estimated drain time before the self-healing
+  // watchdog lifts mic suppression. Covers playback/scheduling jitter so the
+  // mic doesn't reopen a hair early and re-capture the tail of model audio.
+  static const watchdogMargin = Duration(milliseconds: 250);
 }
 
 class GeminiLivePage extends StatefulWidget {
@@ -64,6 +72,16 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   var _micSuppressed = false;
   DateTime? _playbackEndsAt;
   Timer? _resumeMicTimer;
+
+  // Burst/jitter buffer. Gemini streams a whole turn faster than real time, but
+  // the engine's output is a small real-time ring buffer (~43ms). Feeding it
+  // directly overruns it and drops audio (choppy playback). Instead queue the
+  // model PCM and drain it to [AudioIo.outputBytes] at the real-time byte rate.
+  final Queue<Uint8List> _playbackQueue = Queue<Uint8List>();
+  int _queuedBytes = 0;
+  int _playbackHeadOffset = 0;
+  Timer? _playbackTimer;
+  var _playbackPrimed = false;
 
   bool get _isActive =>
       _state == _ConnectionState.connected ||
@@ -128,8 +146,15 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   void _listenToWebSocket() {
     _wsSubscription = _channel?.stream.listen(
       (message) async {
-        if (message is! String) return;
-        final decoded = jsonDecode(message);
+        final String text;
+        if (message is String) {
+          text = message;
+        } else if (message is List<int>) {
+          text = utf8.decode(message);
+        } else {
+          return;
+        }
+        final decoded = jsonDecode(text);
         if (decoded is! Map<String, dynamic>) return;
 
         if (decoded.containsKey('setupComplete')) {
@@ -177,14 +202,21 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   }
 
   Future<void> _startAudio() async {
+    // The native side (AppDelegate on iOS/macOS) requests microphone access on
+    // launch, which is the reliable prompt path. This is a secondary nudge on
+    // platforms where permission_handler is available; the engine's own
+    // authorization check in start() is the final gate.
+    try {
+      await Permission.microphone.request();
+    } on MissingPluginException catch (_) {
+      // No permission_handler implementation on this platform (e.g. macOS); the
+      // native request and the engine's authorization check cover it.
+    }
+
     const config = AudioIoConfig(
       sampleRate: AudioIoSampleRate.rate16000,
       format: AudioIoFormat.pcm16,
       latency: AudioIoLatency.Realtime,
-      // On web the browser controls the AudioContext rate (typically
-      // 44.1/48 kHz), so 16 kHz can't be guaranteed. Opt in to the actual
-      // rate; on native the device honours 16 kHz and this is ignored.
-      allowSampleRateMismatch: true,
     );
 
     await AudioIo.instance.startWith(config);
@@ -194,12 +226,10 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
       final encoded = base64Encode(pcmChunk);
       final message = jsonEncode({
         'realtimeInput': {
-          'mediaChunks': [
-            {
-              'mimeType': _GeminiConfig.inputMimeType,
-              'data': encoded,
-            },
-          ],
+          'audio': {
+            'mimeType': _GeminiConfig.inputMimeType,
+            'data': encoded,
+          },
         },
       });
       _channel?.sink.add(message);
@@ -214,8 +244,24 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
 
     final turnComplete = serverContent['turnComplete'] == true;
     final interrupted = serverContent['interrupted'] == true;
-    if (turnComplete || interrupted) {
+    if (interrupted) {
+      _handleInterruption();
+    } else if (turnComplete) {
       _resumeMicAfterPlayback();
+    }
+  }
+
+  // Gemini reports the turn was interrupted: drop everything still queued for
+  // playback so stale audio is not played over the next turn, and reopen the
+  // mic immediately rather than waiting for a drain that no longer applies.
+  void _handleInterruption() {
+    _clearPlayback();
+    unawaited(AudioIo.instance.clearOutput());
+    _resumeMicTimer?.cancel();
+    _resumeMicTimer = null;
+    _playbackEndsAt = null;
+    if (_micSuppressed) {
+      setState(() => _micSuppressed = false);
     }
   }
 
@@ -239,15 +285,72 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
 
       final pcm24k = base64Decode(data);
       final pcm16k = _resample24kTo16k(Uint8List.fromList(pcm24k));
-      AudioIo.instance.outputBytes.add(pcm16k);
+      _enqueuePlayback(pcm16k);
       _suppressMicWhilePlaying(pcm16k.length);
     }
   }
 
-  void _suppressMicWhilePlaying(int byteCount) {
-    _resumeMicTimer?.cancel();
-    _resumeMicTimer = null;
+  static const _playbackTickMs = 10;
+  static const _playbackPrimeTicks = 3;
 
+  void _enqueuePlayback(Uint8List pcm) {
+    _playbackQueue.add(pcm);
+    _queuedBytes += pcm.length;
+    _playbackTimer ??= Timer.periodic(
+      const Duration(milliseconds: _playbackTickMs),
+      (_) => _drainPlayback(),
+    );
+  }
+
+  void _drainPlayback() {
+    if (_queuedBytes == 0) {
+      _playbackTimer?.cancel();
+      _playbackTimer = null;
+      _playbackPrimed = false;
+      return;
+    }
+
+    final ticks = _playbackPrimed ? 1 : _playbackPrimeTicks;
+    _playbackPrimed = true;
+    var budget = _Playback.bytesPerSecond *
+        _playbackTickMs *
+        ticks ~/
+        Duration.millisecondsPerSecond;
+    if (budget.isOdd) budget -= 1;
+
+    final out = BytesBuilder(copy: false);
+    var taken = 0;
+    while (taken < budget && _playbackQueue.isNotEmpty) {
+      final head = _playbackQueue.first;
+      final available = head.length - _playbackHeadOffset;
+      final want = budget - taken;
+      final n = available <= want ? available : want;
+      final end = _playbackHeadOffset + n;
+      out.add(Uint8List.sublistView(head, _playbackHeadOffset, end));
+      taken += n;
+      _playbackHeadOffset += n;
+      _queuedBytes -= n;
+      if (_playbackHeadOffset >= head.length) {
+        _playbackQueue.removeFirst();
+        _playbackHeadOffset = 0;
+      }
+    }
+
+    if (taken > 0) {
+      AudioIo.instance.outputBytes.add(out.toBytes());
+    }
+  }
+
+  void _clearPlayback() {
+    _playbackTimer?.cancel();
+    _playbackTimer = null;
+    _playbackPrimed = false;
+    _playbackQueue.clear();
+    _queuedBytes = 0;
+    _playbackHeadOffset = 0;
+  }
+
+  void _suppressMicWhilePlaying(int byteCount) {
     final now = DateTime.now();
     final base = (_playbackEndsAt != null && _playbackEndsAt!.isAfter(now))
         ? _playbackEndsAt!
@@ -256,12 +359,24 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
         _Playback.bytesPerSecond;
     _playbackEndsAt = base.add(Duration(milliseconds: chunkMs));
 
+    // Self-healing watchdog: re-arm the resume timer on every chunk so the mic
+    // recovers even if the turnComplete/interrupted signal is dropped or the
+    // socket hiccups mid-turn. Each new chunk pushes the deadline out; once
+    // audio stops arriving the timer fires after the estimated drain time plus
+    // a small margin and lifts suppression — without it a lost signal would
+    // leave the mic muted for the rest of the session.
+    _armMicResume(_Playback.watchdogMargin);
+
     if (!_micSuppressed) {
       setState(() => _micSuppressed = true);
     }
   }
 
-  void _resumeMicAfterPlayback() {
+  // Authoritative end-of-turn signal: resume as soon as the current audio has
+  // drained, no watchdog margin needed.
+  void _resumeMicAfterPlayback() => _armMicResume(Duration.zero);
+
+  void _armMicResume(Duration margin) {
     final now = DateTime.now();
     final endsAt = _playbackEndsAt;
     final remaining = (endsAt != null && endsAt.isAfter(now))
@@ -269,7 +384,7 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
         : Duration.zero;
 
     _resumeMicTimer?.cancel();
-    _resumeMicTimer = Timer(remaining, () {
+    _resumeMicTimer = Timer(remaining + margin, () {
       _playbackEndsAt = null;
       if (!mounted) return;
       setState(() => _micSuppressed = false);
@@ -277,6 +392,7 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
   }
 
   Future<void> _stopAudio() async {
+    _clearPlayback();
     _resumeMicTimer?.cancel();
     _resumeMicTimer = null;
     _playbackEndsAt = null;

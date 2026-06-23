@@ -2,6 +2,12 @@
 
 A Flutter plugin for cross-platform real-time audio streaming. Provides low-latency audio input/output with simple Stream-based API for audio processing, recording, and visualization.
 
+## Live demo
+
+Try the PCM16 streaming + Gemini Live example in your browser:
+**[wamf.github.io/audio_io](https://wamf.github.io/audio_io/)** — paste your own
+[Gemini API key](https://aistudio.google.com/apikey), allow the microphone, and talk.
+
 ## Features
 
 - Real-time audio streaming from microphone to Flutter

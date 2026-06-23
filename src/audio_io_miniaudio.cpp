@@ -51,6 +51,12 @@ public:
         return readCount;
     }
 
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        readPos = 0;
+        writePos = 0;
+    }
+
     size_t available_read() const {
         if (writePos >= readPos) {
             return writePos - readPos;
@@ -296,6 +302,13 @@ int audio_io_write_pcm16(void* handle, const int16_t* buffer, int frameCount) {
     AudioContext* context = (AudioContext*)handle;
     if (!context->outputRingBufferPcm16) return 0;
     return context->outputRingBufferPcm16->write(buffer, frameCount);
+}
+
+void audio_io_clear_output(void* handle) {
+    if (!handle) return;
+    AudioContext* context = (AudioContext*)handle;
+    if (context->outputRingBufferPcm16) context->outputRingBufferPcm16->clear();
+    if (context->outputRingBuffer) context->outputRingBuffer->clear();
 }
 
 int audio_io_get_format(void* handle) {

@@ -1,6 +1,9 @@
 import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+
+import 'src/pcm16_adapters.dart';
 
 // Conditional imports for platform-specific implementations
 import 'src/audio_io_stub.dart'
@@ -10,6 +13,7 @@ import 'src/audio_io_stub.dart'
 class _Methods {
   static const start = 'start';
   static const stop = 'stop';
+  static const clearOutput = 'clearOutput';
   static const requestFrameDuration = 'requestFrameDuration';
   static const getFrameDuration = 'getFrameDuration';
   static const getFormat = 'getFormat';
@@ -62,6 +66,43 @@ enum AudioIoQuality {
   Highest,
 }
 
+/// Wire format for the byte streams ([AudioIo.inputBytes] /
+/// [AudioIo.outputBytes]).
+enum AudioIoFormat { float64, pcm16 }
+
+/// Sample rate the byte streams operate at.
+///
+/// The audio engine runs at a fixed 48 kHz contract internally; the byte
+/// streams are resampled to and from this rate, so callers can work in the
+/// rate their API expects (e.g. 16 kHz in / 24 kHz out for Gemini Live).
+enum AudioIoSampleRate {
+  rate16000(16000),
+  rate24000(24000),
+  rate48000(48000);
+
+  const AudioIoSampleRate(this.hz);
+
+  final int hz;
+}
+
+/// Configuration for [AudioIo.startWith].
+class AudioIoConfig {
+  const AudioIoConfig({
+    this.sampleRate = AudioIoSampleRate.rate48000,
+    this.format = AudioIoFormat.float64,
+    this.latency = AudioIoLatency.Balanced,
+  });
+
+  /// Rate the [AudioIo.inputBytes] / [AudioIo.outputBytes] streams use.
+  final AudioIoSampleRate sampleRate;
+
+  /// Wire format for the byte streams.
+  final AudioIoFormat format;
+
+  /// Callback latency preset.
+  final AudioIoLatency latency;
+}
+
 class AudioIo {
   MethodChannel _methods = const MethodChannel(_Channels.methodChannelName);
   StreamSubscription<List<double>>? _outputSubscription;
@@ -76,6 +117,32 @@ class AudioIo {
       StreamController<List<double>>.broadcast(sync: true);
   StreamController<List<double>> _inputController =
       StreamController<List<double>>.broadcast(sync: true);
+
+  static const int _contractSampleRate = 48000;
+
+  AudioIoConfig? _config;
+  final Pcm16Adapters _pcm16 = Pcm16Adapters();
+
+  /// Configuration passed to the most recent [startWith], or null if the
+  /// session was started with [start] or has been stopped.
+  AudioIoConfig? get currentConfig => _config;
+
+  /// PCM16 (Int16 little-endian) input stream at [AudioIoConfig.sampleRate].
+  ///
+  /// Active after [startWith] with [AudioIoFormat.pcm16]. Resampled from the
+  /// engine's capture rate and encoded from the underlying [input] stream.
+  Stream<Uint8List> get inputBytes => _pcm16.inputBytes;
+
+  /// PCM16 (Int16 little-endian) output sink at [AudioIoConfig.sampleRate].
+  ///
+  /// Active after [startWith] with [AudioIoFormat.pcm16]. Decoded and
+  /// resampled to the engine's 48 kHz contract before reaching [output].
+  ///
+  /// Broadcast so the adapter can re-listen across a stop -> startWith
+  /// restart and a retained sink reference stays valid; a single-subscription
+  /// controller threw `Bad state: Stream has already been listened to` on the
+  /// second startWith.
+  Sink<Uint8List> get outputBytes => _pcm16.outputBytes;
 
 
   Stream<List<double>> get input {
@@ -128,7 +195,47 @@ class AudioIo {
     }
   }
 
+  /// Starts the engine and, for [AudioIoFormat.pcm16], wires the
+  /// [inputBytes] / [outputBytes] streams at [AudioIoConfig.sampleRate].
+  ///
+  /// The engine runs at the fixed 48 kHz contract; the byte streams are
+  /// resampled to and from the requested rate and converted between
+  /// Float64 and Int16, so [AudioIoFormat.float64] callers keep using
+  /// [input] / [output] unchanged.
+  Future<void> startWith(AudioIoConfig config) async {
+    _config = config;
+    await requestLatency(config.latency);
+    await start();
+    if (config.format == AudioIoFormat.pcm16) {
+      await _wirePcm16Adapters(config.sampleRate.hz);
+    }
+  }
+
+  Future<void> _wirePcm16Adapters(int streamRate) async {
+    final format = await getFormat();
+    final inputRate = _engineRate(format, 'input') ?? _contractSampleRate;
+    final outputRate = _engineRate(format, 'output') ?? _contractSampleRate;
+    await _pcm16.wire(
+      streamRate: streamRate,
+      inputEngineRate: inputRate,
+      outputEngineRate: outputRate,
+      inputAudio: input,
+      outputAudio: output,
+    );
+  }
+
+  int? _engineRate(Map<String, dynamic>? format, String direction) {
+    final section = format?[direction];
+    if (section is Map) {
+      final rate = section['sampleRate'];
+      if (rate is num) return rate.round();
+    }
+    return null;
+  }
+
   Future<void> stop() async {
+    await _pcm16.teardown();
+    _config = null;
     if (_impl.usePlatformImpl) {
       await _impl.stop();
       return;
@@ -140,13 +247,25 @@ class AudioIo {
     await _methods.invokeMethod(_Methods.stop);
   }
 
-  Future<Map<String, dynamic>?> getFormat() async {
+  /// Discards audio queued for playback but not yet rendered.
+  ///
+  /// Use this to cut output immediately on a barge-in or when the remote peer
+  /// signals the current response was interrupted, rather than waiting for the
+  /// already-buffered audio to drain.
+  Future<void> clearOutput() async {
     if (_impl.usePlatformImpl) {
-      return _impl.getFormat();
+      await _impl.clearOutput();
+      return;
     }
-    final value = await _methods.invokeMethod(_Methods.getFormat);
-    if (value != null && value is Map<String, dynamic>) {
-      return value;
+    await _methods.invokeMethod(_Methods.clearOutput);
+  }
+
+  Future<Map<String, dynamic>?> getFormat() async {
+    final dynamic value = _impl.usePlatformImpl
+        ? _impl.getFormat()
+        : await _methods.invokeMethod(_Methods.getFormat);
+    if (value is Map) {
+      return value.map((key, dynamic v) => MapEntry(key.toString(), v));
     }
     return null;
   }
@@ -182,6 +301,8 @@ class AudioIo {
   }
 
   void dispose() {
+    _pcm16.dispose();
+    _config = null;
     if (_impl.usePlatformImpl) {
       _impl.stop();
       return;

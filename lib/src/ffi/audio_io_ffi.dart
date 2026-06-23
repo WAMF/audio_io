@@ -77,6 +77,11 @@ class AudioIoFFI {
     }
   }
 
+  void clearOutput() {
+    if (!_isRunning || _handle == null) return;
+    _bindings.clearOutput(_handle!);
+  }
+
   void _startInputPolling() {
     const pollInterval = Duration(milliseconds: 10);
     const framesPerPoll = 480;

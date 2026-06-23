@@ -13,6 +13,9 @@ typedef AudioIoStart = int Function(Pointer<Void> handle);
 typedef AudioIoStopNative = Int32 Function(Pointer<Void> handle);
 typedef AudioIoStop = int Function(Pointer<Void> handle);
 
+typedef AudioIoClearOutputNative = Void Function(Pointer<Void> handle);
+typedef AudioIoClearOutput = void Function(Pointer<Void> handle);
+
 typedef AudioIoReadNative = Int32 Function(
     Pointer<Void> handle, Pointer<Double> buffer, Int32 frameCount);
 typedef AudioIoRead = int Function(
@@ -52,6 +55,7 @@ class AudioIoBindings {
   late final AudioIoDestroy destroy;
   late final AudioIoStart start;
   late final AudioIoStop stop;
+  late final AudioIoClearOutput clearOutput;
   late final AudioIoRead read;
   late final AudioIoWrite write;
   late final AudioIoGetSampleRate getSampleRate;
@@ -78,6 +82,11 @@ class AudioIoBindings {
 
     stop = _lib
         .lookup<NativeFunction<AudioIoStopNative>>('audio_io_stop')
+        .asFunction();
+
+    clearOutput = _lib
+        .lookup<NativeFunction<AudioIoClearOutputNative>>(
+            'audio_io_clear_output')
         .asFunction();
 
     read = _lib

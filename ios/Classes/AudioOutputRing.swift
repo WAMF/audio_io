@@ -12,7 +12,7 @@ import Foundation
 /// priority to the holder, unlike a DispatchQueue - held only for short
 /// bulk copies, so the realtime render thread never waits on descheduled
 /// main-thread work.
-final class AudioOutputRing {
+public final class AudioOutputRing {
     private let storage: UnsafeMutablePointer<Double>
     private let capacity: Int
     private let mask: Int
@@ -20,7 +20,7 @@ final class AudioOutputRing {
     private var tail = 0  // total samples read
     private let lockPtr: UnsafeMutablePointer<os_unfair_lock>
 
-    init(minimumCapacity: Int) {
+    public init(minimumCapacity: Int) {
         var cap = 2048
         while cap < minimumCapacity { cap <<= 1 }
         capacity = cap
@@ -38,7 +38,7 @@ final class AudioOutputRing {
 
     /// Writes as many samples as fit; the excess is dropped.
     @discardableResult
-    func write(_ samples: UnsafeBufferPointer<Double>) -> Int {
+    public func write(_ samples: UnsafeBufferPointer<Double>) -> Int {
         os_unfair_lock_lock(lockPtr)
         let free = capacity - (head - tail)
         let accepted = min(samples.count, free)
@@ -53,7 +53,7 @@ final class AudioOutputRing {
     }
 
     /// Fills [out] with up to [count] samples; the shortfall is zero-filled.
-    func read(into out: UnsafeMutableBufferPointer<Double>, count: Int) {
+    public func read(into out: UnsafeMutableBufferPointer<Double>, count: Int) {
         os_unfair_lock_lock(lockPtr)
         let available = min(count, head - tail)
         var index = tail
@@ -70,7 +70,7 @@ final class AudioOutputRing {
         }
     }
 
-    func clear() {
+    public func clear() {
         os_unfair_lock_lock(lockPtr)
         tail = head
         os_unfair_lock_unlock(lockPtr)
