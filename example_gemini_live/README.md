@@ -8,20 +8,21 @@ through the speaker with mic suppression while the model is talking.
 ## Running
 
 This example tracks only its Dart source and the platform files that carry the
-microphone-permission setup (Info.plist usage strings, macOS entitlements, and
-the `AppDelegate`s that request mic access on launch). Generate the remaining
-platform scaffolding with:
+microphone-permission setup (Info.plist usage strings, macOS entitlements, the
+`AppDelegate`s that request mic access on launch, and the Android manifest
+permissions). Generate the remaining platform scaffolding with:
 
 ```bash
 cd example_gemini_live
-flutter create --platforms=ios,macos .
+flutter create --platforms=ios,macos,android,web .
 flutter pub get
-flutter run -d macos   # or: flutter run -d <your-ios-device-id>
+flutter run -d macos   # or -d <ios/android device id>, or -d chrome
 ```
 
-`flutter create` fills in the build files (Xcode project, Podfile, …) without
-overwriting the committed `Info.plist` / `AppDelegate` / entitlements, so the
-mic-permission wiring is preserved.
+`flutter create` fills in the build files (Xcode project, Podfile, Gradle, …)
+without overwriting the committed `Info.plist` / `AppDelegate` / entitlements /
+`AndroidManifest.xml`, so the mic-permission wiring is preserved. Runs on iOS,
+macOS, Android, and the web.
 
 Then paste a [Gemini API key](https://aistudio.google.com/apikey) into the app,
 tap connect, allow microphone access, and start talking.
@@ -54,3 +55,5 @@ Required platform setup (already committed here):
 - iOS & macOS `Info.plist`: `NSMicrophoneUsageDescription`.
 - macOS entitlements: `com.apple.security.device.audio-input` and
   `com.apple.security.network.client` (the latter for the Gemini WebSocket).
+- Android `AndroidManifest.xml`: `RECORD_AUDIO` and `INTERNET`. The Android
+  `audio_io` backend requests the runtime mic permission when audio starts.
