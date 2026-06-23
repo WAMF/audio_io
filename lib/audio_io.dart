@@ -1,11 +1,9 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import 'src/pcm16_codec.dart';
-import 'src/push_resampler.dart';
+import 'src/pcm16_adapters.dart';
 
 // Conditional imports for platform-specific implementations
 import 'src/audio_io_stub.dart'
@@ -123,12 +121,7 @@ class AudioIo {
   static const int _contractSampleRate = 48000;
 
   AudioIoConfig? _config;
-  StreamController<Uint8List>? _inputBytesController;
-  StreamController<Uint8List>? _outputBytesController;
-  StreamSubscription<List<double>>? _inputBytesSubscription;
-  StreamSubscription<Uint8List>? _outputBytesSubscription;
-  PushResampler? _inputResampler;
-  PushResampler? _outputResampler;
+  final Pcm16Adapters _pcm16 = Pcm16Adapters();
 
   /// Configuration passed to the most recent [startWith], or null if the
   /// session was started with [start] or has been stopped.
@@ -138,16 +131,18 @@ class AudioIo {
   ///
   /// Active after [startWith] with [AudioIoFormat.pcm16]. Resampled from the
   /// engine's capture rate and encoded from the underlying [input] stream.
-  Stream<Uint8List> get inputBytes =>
-      (_inputBytesController ??= StreamController<Uint8List>.broadcast())
-          .stream;
+  Stream<Uint8List> get inputBytes => _pcm16.inputBytes;
 
   /// PCM16 (Int16 little-endian) output sink at [AudioIoConfig.sampleRate].
   ///
   /// Active after [startWith] with [AudioIoFormat.pcm16]. Decoded and
   /// resampled to the engine's 48 kHz contract before reaching [output].
-  Sink<Uint8List> get outputBytes =>
-      (_outputBytesController ??= StreamController<Uint8List>()).sink;
+  ///
+  /// Broadcast so the adapter can re-listen across a stop -> startWith
+  /// restart and a retained sink reference stays valid; a single-subscription
+  /// controller threw `Bad state: Stream has already been listened to` on the
+  /// second startWith.
+  Sink<Uint8List> get outputBytes => _pcm16.outputBytes;
 
 
   Stream<List<double>> get input {
@@ -220,27 +215,13 @@ class AudioIo {
     final format = await getFormat();
     final inputRate = _engineRate(format, 'input') ?? _contractSampleRate;
     final outputRate = _engineRate(format, 'output') ?? _contractSampleRate;
-
-    _outputResampler = PushResampler(streamRate, outputRate);
-    _inputResampler = PushResampler(inputRate, streamRate);
-
-    final outputBytesController =
-        _outputBytesController ??= StreamController<Uint8List>();
-    await _outputBytesSubscription?.cancel();
-    _outputBytesSubscription = outputBytesController.stream.listen((bytes) {
-      final samples = pcm16BytesToFloat64(bytes);
-      output.add(_outputResampler!.process(samples));
-    });
-
-    final inputBytesController =
-        _inputBytesController ??= StreamController<Uint8List>.broadcast();
-    await _inputBytesSubscription?.cancel();
-    _inputBytesSubscription = input.listen((frame) {
-      if (!inputBytesController.hasListener) return;
-      inputBytesController.add(
-        float64ToPcm16Bytes(_inputResampler!.process(frame)),
-      );
-    });
+    await _pcm16.wire(
+      streamRate: streamRate,
+      inputEngineRate: inputRate,
+      outputEngineRate: outputRate,
+      inputAudio: input,
+      outputAudio: output,
+    );
   }
 
   int? _engineRate(Map<String, dynamic>? format, String direction) {
@@ -252,17 +233,8 @@ class AudioIo {
     return null;
   }
 
-  Future<void> _teardownPcm16Adapters() async {
-    await _inputBytesSubscription?.cancel();
-    await _outputBytesSubscription?.cancel();
-    _inputBytesSubscription = null;
-    _outputBytesSubscription = null;
-    _inputResampler = null;
-    _outputResampler = null;
-  }
-
   Future<void> stop() async {
-    await _teardownPcm16Adapters();
+    await _pcm16.teardown();
     _config = null;
     if (_impl.usePlatformImpl) {
       await _impl.stop();
@@ -329,16 +301,7 @@ class AudioIo {
   }
 
   void dispose() {
-    unawaited(_inputBytesSubscription?.cancel());
-    unawaited(_outputBytesSubscription?.cancel());
-    _inputBytesSubscription = null;
-    _outputBytesSubscription = null;
-    _inputResampler = null;
-    _outputResampler = null;
-    _inputBytesController?.close();
-    _outputBytesController?.close();
-    _inputBytesController = null;
-    _outputBytesController = null;
+    _pcm16.dispose();
     _config = null;
     if (_impl.usePlatformImpl) {
       _impl.stop();

@@ -1,3 +1,25 @@
+## 0.4.0
+
+- PCM16 streaming and configurable sample rates: new `AudioIo.startWith`
+  taking an `AudioIoConfig` (`AudioIoFormat.float64` / `pcm16`,
+  `AudioIoSampleRate.rate16000` / `rate24000` / `rate48000`, latency
+  preset). The engine keeps its fixed 48 kHz contract internally; the new
+  byte streams are resampled to and from the requested rate, so callers can
+  work in the rate their API expects (e.g. 16 kHz in / 24 kHz out for
+  Gemini Live).
+- Byte streams: `AudioIo.inputBytes` (Int16 little-endian PCM16 input
+  `Stream<Uint8List>`) and `AudioIo.outputBytes` (PCM16 output
+  `Sink<Uint8List>`), active after `startWith` with `AudioIoFormat.pcm16`.
+  Both are broadcast streams, so the adapters survive a stop -> startWith
+  restart (previously the single-subscription output controller threw
+  `Bad state: Stream has already been listened to` on the second
+  `startWith`).
+- `AudioIo.clearOutput()`: discards audio queued for playback but not yet
+  rendered, for immediate barge-in / interruption handling. Wired across
+  the native (iOS/macOS/Android/desktop) and web back ends.
+- `AudioIo.currentConfig`: the `AudioIoConfig` passed to the most recent
+  `startWith`, or null after `start()` / `stop()`.
+
 ## 0.3.3
 
 - macOS/iOS: the output source node is now pinned to the 48 kHz mono
