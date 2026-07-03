@@ -13,11 +13,12 @@ A new flutter plugin project.
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'Your Company' => 'email@example.com' }
   s.source           = { :path => '.' }
-  s.source_files = 'Classes/**/*'
+  # Sources live under the Swift Package layout so the plugin builds with both
+  # CocoaPods and Swift Package Manager. See ios/audio_io/Package.swift.
+  s.source_files = 'audio_io/Sources/audio_io/**/*.swift'
   s.dependency 'Flutter'
   s.platform = :ios, '13.0'
 
-  # Flutter.framework does not contain a i386 slice. Only x86_64 simulators are supported.
-  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'VALID_ARCHS[sdk=iphonesimulator*]' => 'x86_64' }
+  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.swift_version = '5.0'
 end

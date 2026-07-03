@@ -1,3 +1,16 @@
+## 0.4.1
+
+- Swift Package Manager support for the iOS and macOS plugins, alongside the
+  existing CocoaPods support (no consumer changes required — apps keep using
+  CocoaPods until they opt into SwiftPM). Native sources moved to the Flutter
+  Swift Package layout under `ios/audio_io/Sources/audio_io/` and
+  `macos/audio_io/Sources/audio_io/`, with a `Package.swift` per platform. The
+  podspecs now reference the new source location, so both build systems work.
+- The iOS plugin is now pure Swift: the thin Objective-C registration shim
+  (`AudioIoPlugin.h`/`.m`) was removed and the iOS `pluginClass` is now
+  `SwiftAudioIoPlugin` (which already implemented `register(with:)`). No Dart
+  API changes.
+
 ## 0.4.0
 
 - PCM16 streaming and configurable sample rates: new `AudioIo.startWith`

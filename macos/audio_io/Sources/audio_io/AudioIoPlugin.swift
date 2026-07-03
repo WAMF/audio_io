@@ -353,7 +353,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 }
 
-// AudioOutputRing lives in the shared source ios/Classes/AudioOutputRing.swift
+// AudioOutputRing lives in the shared source ios/audio_io/Sources/audio_io/AudioOutputRing.swift (shared into macOS via symlink)
 // (symlinked into macos/Classes) so the iOS and macOS copies cannot drift.
 
 extension Double {

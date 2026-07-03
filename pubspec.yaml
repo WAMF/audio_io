@@ -1,6 +1,6 @@
 name: audio_io
 description: Very simple interface to provide a stream of audio data for processing/visualising in Flutter
-version: 0.4.0
+version: 0.4.1
 homepage: https://www.wearemobilefirst.com
 
 environment:
@@ -27,7 +27,7 @@ flutter:
   plugin:
     platforms:
       ios:
-        pluginClass: AudioIoPlugin
+        pluginClass: SwiftAudioIoPlugin
       macos:
         pluginClass: AudioIoPlugin
       android:
