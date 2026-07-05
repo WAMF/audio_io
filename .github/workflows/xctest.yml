@@ -70,3 +70,38 @@ jobs:
             -only-testing:RunnerTests \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO
+
+  # This PR adds a SwiftPM manifest (macOS target symlinking AudioOutputRing.swift
+  # from the iOS package) alongside the existing CocoaPods path, but nothing else
+  # in CI ever builds with SwiftPM enabled, so the cross-package symlink is
+  # unverified. This job forces `flutter build --config-only` through the SwiftPM
+  # code path for both platforms, which is enough to prove the symlinked source
+  # resolves and the package graph is valid without needing a full build/codesign.
+  spm-config-only:
+    name: SwiftPM config-only (iOS + macOS)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Enable Swift Package Manager
+        run: flutter config --enable-swift-package-manager
+
+      - name: Resolve Dart/Flutter dependencies
+        working-directory: example
+        run: flutter pub get
+
+      - name: Configure iOS project via SwiftPM (no codesign)
+        working-directory: example
+        run: flutter build ios --config-only --no-codesign
+
+      - name: Configure macOS project via SwiftPM
+        working-directory: example
+        run: flutter build macos --config-only
