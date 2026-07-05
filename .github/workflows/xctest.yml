@@ -74,9 +74,14 @@ jobs:
   # This PR adds a SwiftPM manifest (macOS target symlinking AudioOutputRing.swift
   # from the iOS package) alongside the existing CocoaPods path, but nothing else
   # in CI ever builds with SwiftPM enabled, so the cross-package symlink is
-  # unverified. This job forces `flutter build --config-only` through the SwiftPM
-  # code path for both platforms, which is enough to prove the symlinked source
-  # resolves and the package graph is valid without needing a full build/codesign.
+  # unverified. `flutter build --config-only` only wires the project files and
+  # runs `pod install`; per flutter_tools (macos/build_macos.dart, ios/mac.dart),
+  # `--config-only` returns before Flutter ever shells out to
+  # `xcodebuild -resolvePackageDependencies`, so it does NOT walk the SwiftPM
+  # package graph or touch the symlinked source. The explicit
+  # `-resolvePackageDependencies` steps below are what actually force SwiftPM to
+  # resolve each package's target sources (including the cross-package symlink)
+  # and fail loudly if that resolution is invalid.
   spm-config-only:
     name: SwiftPM config-only (iOS + macOS)
     runs-on: macos-14
@@ -102,6 +107,26 @@ jobs:
         working-directory: example
         run: flutter build ios --config-only --no-codesign
 
+      - name: Force SwiftPM package resolution for iOS
+        working-directory: example/ios
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -workspace Runner.xcworkspace \
+            -scheme Runner
+
       - name: Configure macOS project via SwiftPM
         working-directory: example
         run: flutter build macos --config-only
+
+      # This is the step that actually proves the top-flagged risk: forcing
+      # SwiftPM to resolve the macOS package graph, which requires it to
+      # discover the sources declared by macos/audio_io/Package.swift —
+      # including the symlinked AudioOutputRing.swift. If the symlink escaped
+      # the package root or failed to resolve, this fails with a package
+      # resolution error instead of silently passing.
+      - name: Force SwiftPM package resolution for macOS (validates symlinked source)
+        working-directory: example/macos
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -workspace Runner.xcworkspace \
+            -scheme Runner
