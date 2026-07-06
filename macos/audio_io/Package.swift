@@ -12,11 +12,15 @@ let package = Package(
     // If the plugin name contains "_", replace with "-" for the library name.
     .library(name: "audio-io", targets: ["audio_io"])
   ],
-  dependencies: [],
+  dependencies: [
+    .package(name: "FlutterFramework", path: "../FlutterFramework")
+  ],
   targets: [
     .target(
       name: "audio_io",
-      dependencies: []
+      dependencies: [
+        .product(name: "FlutterFramework", package: "FlutterFramework")
+      ]
     )
   ]
 )
