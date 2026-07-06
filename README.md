@@ -127,6 +127,24 @@ enum AudioIoLatency {
 await audioIo.requestLatency(AudioIoLatency.Realtime);
 ```
 
+### Threading (optional dedicated audio isolate)
+
+By default the audio transport runs on the main isolate, which suits most
+apps and every platform. On the FFI back ends (Android, Windows, Linux) you
+can opt into a dedicated audio isolate so device polling and native buffer
+copies are unaffected by main-isolate jank (heavy widget builds, GC):
+
+```dart
+await audioIo.startWith(const AudioIoConfig(
+  threading: AudioIoThreading.audioIsolate,
+));
+```
+
+Platforms without dedicated-isolate support (iOS, macOS, web) silently fall
+back to main-isolate operation. The `input` / `output` streams still surface
+on the main isolate in both modes, so listener callbacks run there; move
+heavy DSP out of the listener if it competes with UI work.
+
 ## Audio Format
 
 All platforms use a consistent audio format:

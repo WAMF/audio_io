@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:audio_io/src/push_resampler.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -14,6 +15,12 @@ void main() {
       for (var i = 0; i < input.length; i++) {
         expect(output[i], closeTo(input[i], 1e-6));
       }
+    });
+
+    test('identity rate passes a Float32List through without copying', () {
+      final resampler = PushResampler(48000, 48000);
+      final input = Float32List.fromList(List.filled(480, 0.5));
+      expect(identical(resampler.process(input), input), isTrue);
     });
 
     test('output count converges to the rate ratio across chunks', () {

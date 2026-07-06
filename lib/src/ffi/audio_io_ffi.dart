@@ -1,149 +1,134 @@
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
 import 'audio_io_bindings.dart';
 
-class AudioIoFFI {
-  static AudioIoFFI? _instance;
-  static AudioIoFFI get instance => _instance ??= AudioIoFFI._();
+/// Common surface of the FFI transports so the platform layer can swap the
+/// main-isolate and dedicated-isolate implementations behind one type.
+abstract class AudioIoFFITransport {
+  Stream<List<double>>? get inputAudioStream;
+  StreamSink<List<double>>? get outputAudioStream;
 
-  late final AudioIoBindings _bindings;
+  Future<void> start();
+  Future<void> stop();
+  void clearOutput();
+  Map<String, dynamic> getFormat();
+  Future<void> requestFrameDuration(double duration);
+  Future<double> getFrameDuration();
+}
+
+/// Core FFI engine shared by the main-isolate and audio-isolate transports.
+///
+/// Owns the native handle plus reusable native buffers so the poll and write
+/// hot paths run without per-call allocation, and drains the entire native
+/// input ring every poll so a delayed tick recovers immediately instead of
+/// accruing input latency (the previous fixed 480-frame cap drained at
+/// exactly the production rate, so any backlog became permanent).
+class AudioIoFFICore {
+  AudioIoFFICore() : _bindings = AudioIoBindings();
+
+  static const pollInterval = Duration(milliseconds: 5);
+  static const _maxChunkFrames = 4800;
+  static const defaultFormat = <String, dynamic>{
+    'input': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
+    'output': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
+  };
+
+  final AudioIoBindings _bindings;
   Pointer<Void>? _handle;
-
-  StreamController<List<double>>? _inputController;
-  StreamController<List<double>>? _outputController;
-
   Timer? _inputTimer;
-
   bool _isRunning = false;
-  double _requestedFrameDuration = 0.003; // Default to Balanced (3ms)
+  double _requestedFrameDuration = 0.003;
 
-  AudioIoFFI._() {
-    _bindings = AudioIoBindings();
-  }
+  Pointer<Double> _readBuffer = nullptr;
+  int _readCapacity = 0;
+  Pointer<Double> _writeBuffer = nullptr;
+  int _writeCapacity = 0;
 
-  Stream<List<double>>? get inputAudioStream => _inputController?.stream;
-  StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
+  void Function(Float64List frames)? _onInput;
 
-  Future<void> start() async {
+  bool get isRunning => _isRunning;
+
+  void start(void Function(Float64List frames) onInput) {
     if (_isRunning) return;
 
-    _handle = _bindings.create();
-    if (_handle == nullptr) {
+    final handle = _bindings.create();
+    if (handle == nullptr) {
       throw Exception('Failed to create audio context');
     }
 
-    // Set the frame duration before starting
-    _bindings.setFrameDuration(_handle!, _requestedFrameDuration);
+    _bindings.setFrameDuration(handle, _requestedFrameDuration);
 
-    final result = _bindings.start(_handle!);
-    if (result != 0) {
-      _bindings.destroy(_handle!);
-      _handle = null;
+    if (_bindings.start(handle) != 0) {
+      _bindings.destroy(handle);
       throw Exception('Failed to start audio device');
     }
 
+    _handle = handle;
+    _onInput = onInput;
     _isRunning = true;
-
-    _inputController = StreamController<List<double>>.broadcast();
-    _outputController = StreamController<List<double>>();
-
-    _outputController!.stream.listen((data) {
-      _writeAudio(data);
-    });
-
-    _startInputPolling();
+    _inputTimer = Timer.periodic(pollInterval, (_) => _poll());
   }
 
-  Future<void> stop() async {
+  void stop() {
     if (!_isRunning) return;
-
     _isRunning = false;
 
     _inputTimer?.cancel();
     _inputTimer = null;
+    _onInput = null;
 
-    await _inputController?.close();
-    await _outputController?.close();
-    _inputController = null;
-    _outputController = null;
-
-    if (_handle != null) {
-      _bindings.stop(_handle!);
-      _bindings.destroy(_handle!);
+    final handle = _handle;
+    if (handle != null) {
+      _bindings.stop(handle);
+      _bindings.destroy(handle);
       _handle = null;
     }
+
+    _releaseBuffers();
+  }
+
+  void _poll() {
+    final handle = _handle;
+    final onInput = _onInput;
+    if (!_isRunning || handle == null || onInput == null) return;
+
+    var available = _bindings.getAvailableReadFrames(handle);
+    while (available > 0) {
+      final request = math.min(available, _maxChunkFrames);
+      _ensureReadCapacity(request);
+      final framesRead = _bindings.read(handle, _readBuffer, request);
+      if (framesRead <= 0) break;
+      onInput(Float64List.fromList(_readBuffer.asTypedList(framesRead)));
+      available -= framesRead;
+    }
+  }
+
+  void write(List<double> data) {
+    final handle = _handle;
+    if (!_isRunning || handle == null || data.isEmpty) return;
+
+    _ensureWriteCapacity(data.length);
+    _writeBuffer.asTypedList(data.length).setAll(0, data);
+    _bindings.write(handle, _writeBuffer, data.length);
   }
 
   void clearOutput() {
-    if (!_isRunning || _handle == null) return;
-    _bindings.clearOutput(_handle!);
-  }
-
-  void _startInputPolling() {
-    const pollInterval = Duration(milliseconds: 10);
-    const framesPerPoll = 480;
-
-    _inputTimer = Timer.periodic(pollInterval, (_) {
-      if (!_isRunning || _handle == null) return;
-
-      final availableFrames = _bindings.getAvailableReadFrames(_handle!);
-      if (availableFrames > 0) {
-        final framesToRead =
-            availableFrames > framesPerPoll ? framesPerPoll : availableFrames;
-        final buffer = malloc<Double>(framesToRead);
-
-        try {
-          final framesRead = _bindings.read(_handle!, buffer, framesToRead);
-          if (framesRead > 0) {
-            final data = List<double>.generate(
-              framesRead,
-              (i) => buffer[i],
-            );
-            _inputController?.add(data);
-          }
-        } finally {
-          malloc.free(buffer);
-        }
-      }
-    });
-  }
-
-  void _writeAudio(List<double> data) {
-    if (!_isRunning || _handle == null) return;
-
-    final buffer = malloc<Double>(data.length);
-    try {
-      for (int i = 0; i < data.length; i++) {
-        buffer[i] = data[i];
-      }
-
-      _bindings.write(_handle!, buffer, data.length);
-    } finally {
-      malloc.free(buffer);
-    }
+    final handle = _handle;
+    if (!_isRunning || handle == null) return;
+    _bindings.clearOutput(handle);
   }
 
   Map<String, dynamic> getFormat() {
-    if (_handle == null) {
-      return {
-        'input': {
-          'type': 'double',
-          'channels': 1,
-          'sampleRate': 48000.0,
-        },
-        'output': {
-          'type': 'double',
-          'channels': 1,
-          'sampleRate': 48000.0,
-        },
-      };
-    }
+    final handle = _handle;
+    if (handle == null) return defaultFormat;
 
-    final sampleRate = _bindings.getSampleRate(_handle!).toDouble();
-    final channels = _bindings.getChannels(_handle!);
+    final sampleRate = _bindings.getSampleRate(handle).toDouble();
+    final channels = _bindings.getChannels(handle);
 
     return {
       'input': {
@@ -159,17 +144,103 @@ class AudioIoFFI {
     };
   }
 
-  Future<void> requestFrameDuration(double duration) async {
+  void setFrameDuration(double duration) {
     _requestedFrameDuration = duration;
-    if (_handle != null) {
-      _bindings.setFrameDuration(_handle!, duration);
+    final handle = _handle;
+    if (handle != null) {
+      _bindings.setFrameDuration(handle, duration);
     }
   }
 
-  Future<double> getFrameDuration() async {
-    if (_handle != null) {
-      return _bindings.getFrameDuration(_handle!);
+  double getFrameDuration() {
+    final handle = _handle;
+    if (handle != null) {
+      return _bindings.getFrameDuration(handle);
     }
     return 0.01;
   }
+
+  void _ensureReadCapacity(int frames) {
+    if (_readCapacity >= frames) return;
+    if (_readBuffer != nullptr) malloc.free(_readBuffer);
+    _readBuffer = malloc<Double>(frames);
+    _readCapacity = frames;
+  }
+
+  void _ensureWriteCapacity(int frames) {
+    if (_writeCapacity >= frames) return;
+    if (_writeBuffer != nullptr) malloc.free(_writeBuffer);
+    _writeBuffer = malloc<Double>(frames);
+    _writeCapacity = frames;
+  }
+
+  void _releaseBuffers() {
+    if (_readBuffer != nullptr) {
+      malloc.free(_readBuffer);
+      _readBuffer = nullptr;
+      _readCapacity = 0;
+    }
+    if (_writeBuffer != nullptr) {
+      malloc.free(_writeBuffer);
+      _writeBuffer = nullptr;
+      _writeCapacity = 0;
+    }
+  }
+}
+
+/// Main-isolate FFI transport: the poll timer and buffer copies run on the
+/// main isolate. Default mode; see [AudioIoFFIIsolateProxy] for the
+/// dedicated-isolate alternative.
+class AudioIoFFI implements AudioIoFFITransport {
+  AudioIoFFI._();
+
+  static AudioIoFFI? _instance;
+  static AudioIoFFI get instance => _instance ??= AudioIoFFI._();
+
+  final AudioIoFFICore _core = AudioIoFFICore();
+
+  StreamController<List<double>>? _inputController;
+  StreamController<List<double>>? _outputController;
+
+  @override
+  Stream<List<double>>? get inputAudioStream => _inputController?.stream;
+
+  @override
+  StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
+
+  @override
+  Future<void> start() async {
+    if (_core.isRunning) return;
+
+    final inputController = StreamController<List<double>>.broadcast();
+    _core.start(inputController.add);
+    _inputController = inputController;
+
+    _outputController = StreamController<List<double>>();
+    _outputController!.stream.listen(_core.write);
+  }
+
+  @override
+  Future<void> stop() async {
+    if (!_core.isRunning) return;
+    _core.stop();
+    await _inputController?.close();
+    await _outputController?.close();
+    _inputController = null;
+    _outputController = null;
+  }
+
+  @override
+  void clearOutput() => _core.clearOutput();
+
+  @override
+  Map<String, dynamic> getFormat() => _core.getFormat();
+
+  @override
+  Future<void> requestFrameDuration(double duration) async {
+    _core.setFrameDuration(duration);
+  }
+
+  @override
+  Future<double> getFrameDuration() async => _core.getFrameDuration();
 }

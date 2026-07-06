@@ -1,3 +1,43 @@
+## 0.5.0
+
+- Optional dedicated audio isolate: `AudioIoConfig.threading:
+  AudioIoThreading.audioIsolate` runs device polling and native buffer
+  copies on a spawned isolate on the FFI back ends (Android, Windows,
+  Linux), so audio transport is immune to main-isolate jank. The default
+  stays `AudioIoThreading.mainIsolate` and unsupported platforms fall back
+  to it; the Stream/Sink API still surfaces on the main isolate.
+- Web: PCM16 decode and resampling for `outputBytes` now happen inside the
+  output AudioWorklet on the audio rendering thread, and chunks cross to it
+  as transferable buffers instead of structured clones — the main-thread
+  cost per output chunk drops to one copy plus a postMessage, fixing
+  underruns under heavy UI load. Float64 output is likewise resampled in
+  the worklet.
+- Web: microphone capture moved off the deprecated main-thread
+  ScriptProcessorNode onto an input AudioWorkletProcessor that resamples to
+  the 48 kHz contract on the rendering thread and posts transferable
+  chunks (ScriptProcessorNode remains as fallback, now reporting its true
+  device rate via `getFormat`). Input delivery no longer boxes every
+  sample into a growable `List<double>`.
+- FFI transport: the input poll now drains everything available instead of
+  capping at 480 frames per tick (a delayed tick previously turned into
+  permanent input latency), polls at 5 ms, and both directions reuse
+  persistent native buffers with bulk typed-data copies instead of
+  per-sample pointer access and a malloc/free per call.
+- Native (miniaudio): the ring buffers are now lock-free single-producer
+  single-consumer (atomics + bulk memcpy) instead of mutex-guarded
+  per-sample copies, removing a priority-inversion risk in the realtime
+  callback, and the callback no longer heap-allocates conversion buffers.
+- Fixed a latent frame-duration bug on the FFI back ends where a latency
+  requested before the first `start()` was silently dropped.
+- `pcm16BytesToFloat64` / `float64ToPcm16Bytes` use typed-array views on
+  little-endian hosts instead of per-sample `ByteData` calls.
+- Android: the plugin is now declared FFI-only (`ffiPlugin: true` without a
+  `pluginClass`). The previous declaration referenced a Kotlin plugin class
+  that does not exist, which newer Flutter versions reject as a deleted
+  Android v1 embedding plugin. The plugin build also moved to
+  `compileSdk 35` and no longer applies its own Kotlin plugin
+  (Flutter built-in Kotlin compatibility).
+
 ## 0.4.1
 
 - Swift Package Manager support for the iOS and macOS plugins, alongside the

@@ -2,62 +2,78 @@ import 'dart:async';
 import 'dart:io';
 
 import 'audio_io_stub.dart';
+import 'audio_io_threading.dart';
 import 'ffi/audio_io_ffi.dart';
+import 'ffi/audio_io_isolate.dart';
 
-class AudioIoNative implements AudioIoImpl {
-  AudioIoFFI? _ffi;
+class AudioIoNative extends AudioIoImpl {
+  AudioIoFFITransport? _transport;
+  AudioIoThreading _threading = AudioIoThreading.mainIsolate;
+  double? _pendingFrameDuration;
 
   @override
   bool get usePlatformImpl =>
       Platform.isAndroid || Platform.isWindows || Platform.isLinux;
 
   @override
-  Stream<List<double>>? get inputAudioStream => _ffi?.inputAudioStream;
+  Stream<List<double>>? get inputAudioStream => _transport?.inputAudioStream;
 
   @override
-  StreamSink<List<double>>? get outputAudioStream => _ffi?.outputAudioStream;
+  StreamSink<List<double>>? get outputAudioStream =>
+      _transport?.outputAudioStream;
+
+  @override
+  void configureThreading(AudioIoThreading threading) {
+    _threading = threading;
+  }
 
   @override
   Future<void> start() async {
-    _ffi = AudioIoFFI.instance;
-    await _ffi!.start();
+    final wantIsolate = _threading == AudioIoThreading.audioIsolate;
+    if (_transport != null &&
+        (_transport is AudioIoFFIIsolateProxy) != wantIsolate) {
+      await _transport!.stop();
+      _transport = null;
+    }
+    _transport ??=
+        wantIsolate ? AudioIoFFIIsolateProxy() : AudioIoFFI.instance;
+
+    final pending = _pendingFrameDuration;
+    if (pending != null) {
+      await _transport!.requestFrameDuration(pending);
+      _pendingFrameDuration = null;
+    }
+    await _transport!.start();
   }
 
   @override
   Future<void> stop() async {
-    await _ffi?.stop();
+    await _transport?.stop();
   }
 
   @override
   Future<void> clearOutput() async {
-    _ffi?.clearOutput();
+    _transport?.clearOutput();
   }
 
   @override
   Map<String, dynamic> getFormat() {
-    return _ffi?.getFormat() ??
-        {
-          'input': {
-            'type': 'double',
-            'channels': 1,
-            'sampleRate': 48000.0,
-          },
-          'output': {
-            'type': 'double',
-            'channels': 1,
-            'sampleRate': 48000.0,
-          },
-        };
+    return _transport?.getFormat() ?? AudioIoFFICore.defaultFormat;
   }
 
   @override
   Future<void> requestFrameDuration(double duration) async {
-    await _ffi?.requestFrameDuration(duration);
+    final transport = _transport;
+    if (transport != null) {
+      await transport.requestFrameDuration(duration);
+      return;
+    }
+    _pendingFrameDuration = duration;
   }
 
   @override
   Future<double> getFrameDuration() async {
-    return await _ffi?.getFrameDuration() ?? 0.01;
+    return await _transport?.getFrameDuration() ?? 0.01;
   }
 }
 

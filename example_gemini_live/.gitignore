@@ -5,10 +5,16 @@ build/
 *.env
 pubspec.lock
 ios/
-android/
 macos/
 web/
 linux/
 windows/
 .flutter-plugins
 .flutter-plugins-dependencies
+*.iml
+
+# Android: the host project is tracked so the example builds from a fresh
+# clone; generated and machine-local files are not.
+android/.gradle/
+android/local.properties
+android/app/src/main/java/io/flutter/plugins/
