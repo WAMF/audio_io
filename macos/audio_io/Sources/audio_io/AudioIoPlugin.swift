@@ -193,7 +193,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
                 }
                 autoreleasepool {
                     data.withUnsafeBytes { rawPtr in
-                        instance.buffer.write(rawPtr.bindMemory(to: Double.self))
+                        _ = instance.buffer.write(rawPtr.bindMemory(to: Double.self))
                     }
                 }
             })
