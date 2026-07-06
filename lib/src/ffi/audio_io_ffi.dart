@@ -152,12 +152,15 @@ class AudioIoFFICore {
     }
   }
 
+  /// The device's actual frame duration when running, otherwise the
+  /// requested one — matching the isolate transport, which reports the
+  /// requested duration until its worker delivers the device value.
   double getFrameDuration() {
     final handle = _handle;
     if (handle != null) {
       return _bindings.getFrameDuration(handle);
     }
-    return 0.01;
+    return _requestedFrameDuration;
   }
 
   void _ensureReadCapacity(int frames) {
