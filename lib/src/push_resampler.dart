@@ -17,11 +17,7 @@ class PushResampler {
 
   Float32List process(List<double> input) {
     if (sourceRate == targetRate) {
-      final out = Float32List(input.length);
-      for (var i = 0; i < input.length; i++) {
-        out[i] = input[i];
-      }
-      return out;
+      return input is Float32List ? input : Float32List.fromList(input);
     }
 
     final out = Float32List(input.length * targetRate ~/ sourceRate + 2);

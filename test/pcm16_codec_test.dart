@@ -35,6 +35,24 @@ void main() {
       expect(samples, [0.0, 1.0, -1.0]);
     });
 
+    test('decodes an unaligned byte view identically to an aligned one', () {
+      // The fast path views the bytes as an Int16List, which requires a
+      // 2-byte-aligned offset; an odd-offset view must take the ByteData
+      // fallback and produce identical samples.
+      final backing = Uint8List(7);
+      final aligned = ByteData.sublistView(backing, 0)
+        ..setInt16(1, 12345, Endian.little)
+        ..setInt16(3, -32767, Endian.little)
+        ..setInt16(5, 255, Endian.little);
+      expect(aligned, isNotNull);
+      final unaligned = Uint8List.sublistView(backing, 1);
+      final alignedCopy = Uint8List.fromList(unaligned);
+
+      expect(pcm16BytesToFloat64(unaligned), pcm16BytesToFloat64(alignedCopy));
+      expect(pcm16BytesToFloat64(unaligned),
+          [12345 / pcm16FullScale, -1.0, 255 / pcm16FullScale]);
+    });
+
     test('round-trips a sine wave within one LSB', () {
       final input = List<double>.generate(
         256,
