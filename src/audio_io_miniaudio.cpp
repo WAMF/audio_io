@@ -1,8 +1,9 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
+#include <algorithm>
 #include <cstring>
+#include <cstdint>
 #include <cstdlib>
-#include <mutex>
 #include <atomic>
 #include <vector>
 #include <cmath>
@@ -16,56 +17,80 @@ const int CHANNELS = 1;
 const int AUDIO_FORMAT_FLOAT64 = 0;
 const int AUDIO_FORMAT_PCM16 = 1;
 
+// Single-producer single-consumer lock-free ring buffer.
+//
+// Power-of-two storage with monotonic 64-bit positions: the producer only
+// advances head, the consumer only advances tail, each side reads the other
+// with acquire ordering. The realtime audio callback therefore never blocks
+// behind a descheduled Dart thread, which the previous std::mutex allowed
+// (priority inversion -> audible glitches). Copies are bulk memcpy in at
+// most two segments instead of per-sample modulo arithmetic.
+//
+// clear() only requests a clear: the consumer applies it at its next read,
+// because tail belongs exclusively to the consumer.
 template <typename T>
 class RingBuffer {
 private:
     std::vector<T> buffer;
-    size_t writePos;
-    size_t readPos;
-    size_t size;
-    std::mutex mutex;
+    size_t capacity;
+    size_t mask;
+    std::atomic<uint64_t> head{0};
+    std::atomic<uint64_t> tail{0};
+    std::atomic<bool> clearRequested{false};
+
+    static size_t nextPow2(size_t value) {
+        size_t result = 1;
+        while (result < value) result <<= 1;
+        return result;
+    }
 
 public:
-    RingBuffer(size_t bufferSize)
-        : buffer(bufferSize), writePos(0), readPos(0), size(bufferSize) {}
+    explicit RingBuffer(size_t minCapacity)
+        : buffer(nextPow2(minCapacity)),
+          capacity(buffer.size()),
+          mask(buffer.size() - 1) {}
 
     size_t write(const T* data, size_t count) {
-        std::lock_guard<std::mutex> lock(mutex);
-        size_t written = 0;
-        for (size_t i = 0; i < count && available_write() > 0; i++) {
-            buffer[writePos] = data[i];
-            writePos = (writePos + 1) % size;
-            written++;
-        }
-        return written;
+        const uint64_t h = head.load(std::memory_order_relaxed);
+        const uint64_t t = tail.load(std::memory_order_acquire);
+        const size_t free = capacity - (size_t)(h - t);
+        const size_t n = count < free ? count : free;
+        const size_t start = (size_t)(h & mask);
+        const size_t first = n < capacity - start ? n : capacity - start;
+        std::memcpy(buffer.data() + start, data, first * sizeof(T));
+        std::memcpy(buffer.data(), data + first, (n - first) * sizeof(T));
+        head.store(h + n, std::memory_order_release);
+        return n;
     }
 
     size_t read(T* data, size_t count) {
-        std::lock_guard<std::mutex> lock(mutex);
-        size_t readCount = 0;
-        for (size_t i = 0; i < count && available_read() > 0; i++) {
-            data[i] = buffer[readPos];
-            readPos = (readPos + 1) % size;
-            readCount++;
+        if (clearRequested.exchange(false, std::memory_order_acq_rel)) {
+            tail.store(head.load(std::memory_order_acquire),
+                       std::memory_order_release);
         }
-        return readCount;
+        const uint64_t t = tail.load(std::memory_order_relaxed);
+        const uint64_t h = head.load(std::memory_order_acquire);
+        const size_t avail = (size_t)(h - t);
+        const size_t n = count < avail ? count : avail;
+        const size_t start = (size_t)(t & mask);
+        const size_t first = n < capacity - start ? n : capacity - start;
+        std::memcpy(data, buffer.data() + start, first * sizeof(T));
+        std::memcpy(data + first, buffer.data(), (n - first) * sizeof(T));
+        tail.store(t + n, std::memory_order_release);
+        return n;
     }
 
     void clear() {
-        std::lock_guard<std::mutex> lock(mutex);
-        readPos = 0;
-        writePos = 0;
+        clearRequested.store(true, std::memory_order_release);
     }
 
     size_t available_read() const {
-        if (writePos >= readPos) {
-            return writePos - readPos;
-        }
-        return size - readPos + writePos;
+        return (size_t)(head.load(std::memory_order_acquire) -
+                        tail.load(std::memory_order_acquire));
     }
 
     size_t available_write() const {
-        return size - available_read() - 1;
+        return capacity - available_read();
     }
 };
 
@@ -78,12 +103,18 @@ static size_t ringBufferSizeForRate(int sampleRate) {
     return size;
 }
 
+// Scratch buffers must cover the largest callback the backend can deliver;
+// sized generously up front so the realtime callback never allocates.
+const size_t SCRATCH_FRAMES = 8192;
+
 struct AudioContext {
     ma_device device;
     DoubleRingBuffer* inputRingBuffer;
     DoubleRingBuffer* outputRingBuffer;
     Int16RingBuffer* inputRingBufferPcm16;
     Int16RingBuffer* outputRingBufferPcm16;
+    std::vector<double> scratchDouble;
+    std::vector<int16_t> scratchPcm16;
     std::atomic<bool> isRunning;
     std::atomic<bool> isDeviceInitialized;
     double frameDuration;
@@ -104,9 +135,11 @@ struct AudioContext {
         if (fmt == AUDIO_FORMAT_PCM16) {
             inputRingBufferPcm16 = new Int16RingBuffer(bufSize);
             outputRingBufferPcm16 = new Int16RingBuffer(bufSize);
+            scratchPcm16.resize(SCRATCH_FRAMES);
         } else {
             inputRingBuffer = new DoubleRingBuffer(bufSize);
             outputRingBuffer = new DoubleRingBuffer(bufSize);
+            scratchDouble.resize(SCRATCH_FRAMES);
         }
     }
 
@@ -118,42 +151,55 @@ struct AudioContext {
     }
 };
 
+// Runs on the realtime audio thread: no locks, no allocation. Conversions
+// go through preallocated scratch, chunked in case the backend delivers a
+// callback larger than the scratch buffer.
 void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     AudioContext* context = (AudioContext*)pDevice->pUserData;
 
     if (context->format == AUDIO_FORMAT_PCM16) {
+        int16_t* scratch = context->scratchPcm16.data();
         if (pInput) {
-            float* floatInput = (float*)pInput;
-            std::vector<int16_t> tempBuffer(frameCount);
-            for (ma_uint32 i = 0; i < frameCount; i++) {
-                float clamped = fminf(fmaxf(floatInput[i], -1.0f), 1.0f);
-                tempBuffer[i] = (int16_t)(clamped * 32767.0f);
+            const float* floatInput = (const float*)pInput;
+            for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
+                const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
+                for (ma_uint32 i = 0; i < n; i++) {
+                    float clamped = fminf(fmaxf(floatInput[offset + i], -1.0f), 1.0f);
+                    scratch[i] = (int16_t)(clamped * 32767.0f);
+                }
+                context->inputRingBufferPcm16->write(scratch, n);
             }
-            context->inputRingBufferPcm16->write(tempBuffer.data(), frameCount);
         }
         if (pOutput) {
             float* floatOutput = (float*)pOutput;
-            std::vector<int16_t> tempBuffer(frameCount);
-            size_t framesRead = context->outputRingBufferPcm16->read(tempBuffer.data(), frameCount);
-            for (ma_uint32 i = 0; i < frameCount; i++) {
-                floatOutput[i] = (i < framesRead) ? (float)tempBuffer[i] / 32767.0f : 0.0f;
+            for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
+                const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
+                size_t framesRead = context->outputRingBufferPcm16->read(scratch, n);
+                for (ma_uint32 i = 0; i < n; i++) {
+                    floatOutput[offset + i] = (i < framesRead) ? (float)scratch[i] / 32767.0f : 0.0f;
+                }
             }
         }
     } else {
+        double* scratch = context->scratchDouble.data();
         if (pInput) {
-            float* floatInput = (float*)pInput;
-            std::vector<double> tempBuffer(frameCount);
-            for (ma_uint32 i = 0; i < frameCount; i++) {
-                tempBuffer[i] = (double)floatInput[i];
+            const float* floatInput = (const float*)pInput;
+            for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
+                const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
+                for (ma_uint32 i = 0; i < n; i++) {
+                    scratch[i] = (double)floatInput[offset + i];
+                }
+                context->inputRingBuffer->write(scratch, n);
             }
-            context->inputRingBuffer->write(tempBuffer.data(), frameCount);
         }
         if (pOutput) {
             float* floatOutput = (float*)pOutput;
-            std::vector<double> tempBuffer(frameCount);
-            size_t framesRead = context->outputRingBuffer->read(tempBuffer.data(), frameCount);
-            for (ma_uint32 i = 0; i < frameCount; i++) {
-                floatOutput[i] = (i < framesRead) ? (float)tempBuffer[i] : 0.0f;
+            for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
+                const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
+                size_t framesRead = context->outputRingBuffer->read(scratch, n);
+                for (ma_uint32 i = 0; i < n; i++) {
+                    floatOutput[offset + i] = (i < framesRead) ? (float)scratch[i] : 0.0f;
+                }
             }
         }
     }
