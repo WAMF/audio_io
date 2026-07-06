@@ -1,5 +1,5 @@
 import AVFoundation
-import Flutter
+import FlutterMacOS
 
 extension Data {
     init<T>(fromArray values: [T]) {
@@ -21,7 +21,7 @@ enum _Constants {
     /// play at correct speed while the engine keeps consuming 48 k/s.
     static let outputContractSampleRate = 48000.0
     static let workspaceSamples = 100_000
-    static let defaultFrameDuration = 0.003  // (3ms)
+    static let defaultFrameDuration = 0.003
     static let defaultMaxFrameJitter = 4.0
     static let processingQueueName = "SwiftAudioIoPluginQueue"
     static let ringBufferSize = 2048
@@ -40,8 +40,6 @@ enum Methods: String {
 enum AudioIoError {
     static let permissionDeniedCode = "MICROPHONE_PERMISSION_DENIED"
     static let permissionDeniedMessage = "Microphone permission not granted. This plugin requires microphone access to function. Please request microphone permission using a package like permission_handler before calling start()."
-    static let audioSessionCode = "AUDIO_SESSION_ERROR"
-    static let audioSessionMessage = "Failed to configure audio session"
     static let engineStartCode = "ENGINE_START_ERROR"
     static let engineStartMessage = "Failed to start audio engine"
 }
@@ -109,7 +107,7 @@ class DataBufferPool {
     }
 }
 
-public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
+public class AudioIoPlugin: NSObject, FlutterPlugin {
     let engine = AVAudioEngine()
     var inputConverter = AVAudioMixerNode()
     var _binaryMessenger: FlutterBinaryMessenger?
@@ -183,10 +181,10 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
 
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(
-            name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger())
-        let instance = SwiftAudioIoPlugin()
+            name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger)
+        let instance = AudioIoPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
-        instance._binaryMessenger = registrar.messenger()
+        instance._binaryMessenger = registrar.messenger
         instance._binaryMessenger?.setMessageHandlerOnChannel(
             Channels.outputChannelName.rawValue,
             binaryMessageHandler: { [weak instance] data, _ in
@@ -195,7 +193,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                 }
                 autoreleasepool {
                     data.withUnsafeBytes { rawPtr in
-                        instance.buffer.write(rawPtr.bindMemory(to: Double.self))
+                        _ = instance.buffer.write(rawPtr.bindMemory(to: Double.self))
                     }
                 }
             })
@@ -204,12 +202,6 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             instance, selector: #selector(handleConfigChange),
             name: NSNotification.Name.AVAudioEngineConfigurationChange,
             object: instance.engine)
-        NotificationCenter.default.addObserver(
-            instance, selector: #selector(handleRouteChange),
-            name: AVAudioSession.routeChangeNotification, object: nil)
-        NotificationCenter.default.addObserver(
-            instance, selector: #selector(handleInterruption),
-            name: AVAudioSession.interruptionNotification, object: nil)
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -226,12 +218,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             if let requested = call.arguments as? Double {
                 _frameDuration = requested
                 if _isRunning {
-                    do {
-                        try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(
-                            _frameDuration)
-                        resetAudio()
-                    } catch {
-                    }
+                    resetAudio()
                 }
             }
             result(nil)
@@ -251,22 +238,20 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     public func start(result: @escaping FlutterResult) {
-        let permissionStatus = AVAudioSession.sharedInstance().recordPermission
-
-        switch permissionStatus {
-        case .denied:
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .denied, .restricted:
             result(FlutterError(
                 code: AudioIoError.permissionDeniedCode,
                 message: AudioIoError.permissionDeniedMessage,
                 details: nil))
             return
-        case .undetermined:
+        case .notDetermined:
             result(FlutterError(
                 code: AudioIoError.permissionDeniedCode,
                 message: AudioIoError.permissionDeniedMessage,
                 details: nil))
             return
-        case .granted:
+        case .authorized:
             break
         @unknown default:
             break
@@ -290,11 +275,6 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                     Int(_frameDuration * _Constants.outputContractSampleRate
                         * maxFrameJitter)))
 
-        try AVAudioSession.sharedInstance().setCategory(
-            .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
-        try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
-        try AVAudioSession.sharedInstance().setPreferredSampleRate(_Constants.preferedSampleRate)
-
         try setupPipelineIfNeeded()
 
         let expectedFrameSize = Int(_frameDuration * _sampleRate)
@@ -309,13 +289,12 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
 
     public func setupPipelineIfNeeded() throws {
         if !_isPipelineSetup {
-            // Setup engine and node instances
             let input = engine.inputNode
             let output = engine.mainMixerNode
             let inputFormat = input.inputFormat(forBus: 0)
             _sampleRate = inputFormat.sampleRate
             inputConverter.outputVolume = 1.0
-            // Connect nodes
+
             let sourceNode = createSourceNode()
             let processingformat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1,
@@ -342,43 +321,6 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
 
     @objc func handleConfigChange(notification _: NSNotification) {
         resetAudio()
-    }
-
-    @objc func handleInterruption(notification: NSNotification) {
-        guard let userInfo = notification.userInfo,
-            let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
-            let type = AVAudioSession.InterruptionType(rawValue: typeValue),
-            _isRunning
-        else {
-            return
-        }
-        switch type {
-        case .began:
-            break
-        case .ended:
-            break
-        default: ()
-        }
-    }
-
-    @objc func handleRouteChange(notification: NSNotification) {
-        guard let userInfo = notification.userInfo,
-            let reasonValue = userInfo[AVAudioSessionRouteChangeReasonKey] as? UInt,
-            let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
-        else {
-            return
-        }
-        switch reason {
-        case .newDeviceAvailable:
-            break
-        case .oldDeviceUnavailable:
-            break
-        case .routeConfigurationChange:
-            break
-        case .categoryChange:
-            break
-        default: ()
-        }
     }
 
     public func resetAudio() {
@@ -411,7 +353,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     }
 }
 
-// AudioOutputRing lives in the shared source ios/Classes/AudioOutputRing.swift
+// AudioOutputRing lives in the shared source ios/audio_io/Sources/audio_io/AudioOutputRing.swift (shared into macOS via symlink)
 // (symlinked into macos/Classes) so the iOS and macOS copies cannot drift.
 
 extension Double {

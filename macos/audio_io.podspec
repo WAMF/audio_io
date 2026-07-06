@@ -14,8 +14,9 @@ Very simple interface to provide a stream of audio data for processing/visualisi
   s.author           = { 'Mobile First' => 'hello@wearemobilefirst.com' }
 
   s.source           = { :path => '.' }
-  s.source_files     = 'Classes/**/*'
-  s.public_header_files = 'Classes/**/*.h'
+  # Sources live under the Swift Package layout so the plugin builds with both
+  # CocoaPods and Swift Package Manager. See macos/audio_io/Package.swift.
+  s.source_files     = 'audio_io/Sources/audio_io/**/*.swift'
   s.dependency 'FlutterMacOS'
 
   s.platform = :osx, '10.15'

@@ -1,5 +1,10 @@
 # See https://www.dartlang.org/guides/libraries/private-files
 
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
 # Files and directories created by pub
 .dart_tool/
 .packages
@@ -125,7 +130,10 @@ cmake-build-*/
 
 # IDE - Xcode workspace user data
 **/xcuserdata/
-**/xcshareddata/
+# NOTE: do NOT blanket-ignore **/xcshareddata/ here - it also matches
+# Runner.xcodeproj/xcshareddata/xcschemes/, which must be committed so the
+# macOS/iOS Runner scheme is shared (required for Flutter's Swift Package
+# Manager integration and for xcodebuild in CI to find the Runner scheme).
 **/project.xcworkspace/contents.xcworkspacedata
 **/project.xcworkspace/xcshareddata/
 *.xcworkspace/xcuserdata/
