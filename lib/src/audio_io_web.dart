@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:js_interop';
+import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
 
 import 'package:web/web.dart' as web;
 
 import 'audio_io_stub.dart';
 import 'output_ring.dart';
-import 'push_resampler.dart';
 
 @JS('AudioContext')
 @staticInterop
@@ -37,6 +37,8 @@ class MediaStreamAudioSourceNode {}
 
 extension MediaStreamAudioSourceNodeExt on MediaStreamAudioSourceNode {
   external void connect(ScriptProcessorNode node);
+  @JS('connect')
+  external void connectWorklet(AudioWorkletNodeJs node);
 }
 
 @JS()
@@ -73,7 +75,8 @@ extension AudioWorkletJsExt on AudioWorkletJs {
 @JS('AudioWorkletNode')
 @staticInterop
 class AudioWorkletNodeJs {
-  external factory AudioWorkletNodeJs(AudioContext context, String name);
+  external factory AudioWorkletNodeJs(AudioContext context, String name,
+      [JSAny? options]);
 }
 
 extension AudioWorkletNodeJsExt on AudioWorkletNodeJs {
@@ -88,6 +91,10 @@ class MessagePortJs {}
 
 extension MessagePortJsExt on MessagePortJs {
   external void postMessage(JSAny? message);
+  @JS('postMessage')
+  external void postMessageWithTransfer(
+      JSAny? message, JSArray<JSObject> transfer);
+  external set onmessage(JSFunction? handler);
 }
 
 extension AudioBufferExt on AudioBuffer {
@@ -96,9 +103,17 @@ extension AudioBufferExt on AudioBuffer {
   external int get length;
 }
 
-/// JavaScript for the output AudioWorkletProcessor: a simple
-/// single-producer single-consumer ring drained on the audio rendering
-/// thread, immune to main-thread jank.
+/// JavaScript for the AudioWorkletProcessors.
+///
+/// Output: a single-producer single-consumer ring drained on the audio
+/// rendering thread. Chunks arrive as transferable buffers already in wire
+/// format (Float32 or PCM16 Int16) at a declared source rate; decoding and
+/// linear resampling to the context rate happen HERE, on the rendering
+/// thread, so the main thread's only per-chunk cost is a postMessage. The
+/// resampler mirrors the Dart PushResampler phase arithmetic.
+///
+/// Input: captures at the context rate, resamples to the 48 kHz contract,
+/// and posts transferable fixed-size chunks back to the main thread.
 const String _workletSource = '''
 class AudioIoOutput extends AudioWorkletProcessor {
   constructor() {
@@ -108,20 +123,51 @@ class AudioIoOutput extends AudioWorkletProcessor {
     this.buf = new Float32Array(this.capacity);
     this.head = 0;
     this.tail = 0;
+    this.prev = 0;
+    this.phase = sampleRate;
     this.port.onmessage = (e) => {
       const d = e.data;
       if (d === 'clear') {
         this.head = 0;
         this.tail = 0;
+        this.prev = 0;
+        this.phase = sampleRate;
         return;
       }
-      const free = this.capacity - (this.head - this.tail);
-      const n = Math.min(d.length, free);
-      for (let i = 0; i < n; i++) {
-        this.buf[(this.head + i) & this.mask] = d[i];
-      }
-      this.head += n;
+      const pcm16 = d.fmt === 'pcm16';
+      const samples = pcm16
+        ? new Int16Array(d.buf, d.off, d.len)
+        : new Float32Array(d.buf, d.off, d.len);
+      this.push(samples, pcm16 ? 1 / 32767 : 1, d.rate);
     };
+  }
+  writeSample(v) {
+    if (this.head - this.tail < this.capacity) {
+      this.buf[this.head & this.mask] = v;
+      this.head++;
+    }
+  }
+  push(samples, scale, srcRate) {
+    const dstRate = sampleRate;
+    if (srcRate === dstRate) {
+      for (let i = 0; i < samples.length; i++) {
+        this.writeSample(samples[i] * scale);
+      }
+      return;
+    }
+    let prev = this.prev;
+    let phase = this.phase;
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i] * scale;
+      while (phase < dstRate) {
+        this.writeSample(prev + (s - prev) * (phase / dstRate));
+        phase += srcRate;
+      }
+      phase -= dstRate;
+      prev = s;
+    }
+    this.prev = prev;
+    this.phase = phase;
   }
   process(inputs, outputs) {
     const out = outputs[0][0];
@@ -137,25 +183,128 @@ class AudioIoOutput extends AudioWorkletProcessor {
     return true;
   }
 }
+
+class AudioIoInput extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const opts = (options && options.processorOptions) || {};
+    this.targetRate = opts.targetRate || 48000;
+    this.chunkFrames = opts.chunkFrames || 1024;
+    this.chunk = new Float32Array(this.chunkFrames);
+    this.fill = 0;
+    this.prev = 0;
+    this.phase = this.targetRate;
+  }
+  emit(v) {
+    this.chunk[this.fill++] = v;
+    if (this.fill === this.chunkFrames) {
+      this.port.postMessage(this.chunk, [this.chunk.buffer]);
+      this.chunk = new Float32Array(this.chunkFrames);
+      this.fill = 0;
+    }
+  }
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (!channel) return true;
+    const srcRate = sampleRate;
+    const dstRate = this.targetRate;
+    if (srcRate === dstRate) {
+      for (let i = 0; i < channel.length; i++) {
+        this.emit(channel[i]);
+      }
+      return true;
+    }
+    let prev = this.prev;
+    let phase = this.phase;
+    for (let i = 0; i < channel.length; i++) {
+      const s = channel[i];
+      while (phase < dstRate) {
+        this.emit(prev + (s - prev) * (phase / dstRate));
+        phase += srcRate;
+      }
+      phase -= dstRate;
+      prev = s;
+    }
+    this.prev = prev;
+    this.phase = phase;
+    return true;
+  }
+}
+
 registerProcessor('audio-io-output', AudioIoOutput);
+registerProcessor('audio-io-input', AudioIoInput);
 ''';
+
+class _MessageFields {
+  static const format = 'fmt';
+  static const buffer = 'buf';
+  static const byteOffset = 'off';
+  static const length = 'len';
+  static const rate = 'rate';
+}
+
+class _Formats {
+  static const float32 = 'f32';
+  static const pcm16 = 'pcm16';
+}
+
+/// Posts [buffer] to a worklet port as a transferable, so crossing to the
+/// audio rendering thread is a hand-off rather than a structured clone.
+/// The buffer must be freshly allocated by the caller: transfer detaches it.
+void _postSamples(MessagePortJs port, String format, ByteBuffer buffer,
+    int byteOffset, int length, int rate) {
+  final jsBuffer = buffer.toJS;
+  final message = JSObject()
+    ..[_MessageFields.format] = format.toJS
+    ..[_MessageFields.buffer] = jsBuffer
+    ..[_MessageFields.byteOffset] = byteOffset.toJS
+    ..[_MessageFields.length] = length.toJS
+    ..[_MessageFields.rate] = rate.toJS;
+  port.postMessageWithTransfer(message, <JSObject>[jsBuffer].toJS);
+}
+
+/// PCM16 sink that feeds the output worklet directly: decode and resampling
+/// happen on the audio rendering thread, so pushing a chunk costs the main
+/// thread one copy and one postMessage.
+class _WorkletPcm16Sink implements Sink<Uint8List> {
+  _WorkletPcm16Sink(this._port, this._sourceRate);
+
+  final MessagePortJs _port;
+  final int _sourceRate;
+
+  static const _bytesPerSample = 2;
+
+  @override
+  void add(Uint8List data) {
+    if (data.isEmpty) return;
+    // Copied so the transferred (detached) buffer is never one the caller
+    // still holds, and so the Int16Array view starts 2-byte aligned.
+    final owned = Uint8List.fromList(data);
+    _postSamples(_port, _Formats.pcm16, owned.buffer, 0,
+        owned.length ~/ _bytesPerSample, _sourceRate);
+  }
+
+  @override
+  void close() {}
+}
 
 /// Web implementation.
 ///
 /// Output goes through an [AudioWorkletNode] when available: the worklet
-/// owns a ring buffer drained on the dedicated audio rendering thread, so
-/// main-thread jank cannot glitch playback. Browsers without worklet
-/// support fall back to a ScriptProcessorNode fed from an O(1)
-/// [OutputRing] with bulk copies.
+/// owns a ring buffer drained on the dedicated audio rendering thread, and
+/// also performs PCM16 decoding and resampling there, so main-thread jank
+/// cannot glitch playback and the main-thread cost per chunk is one
+/// transferable postMessage. Browsers without worklet support fall back to
+/// a ScriptProcessorNode fed from an O(1) [OutputRing] with bulk copies.
 ///
-/// Clients always push 48 kHz data; when the AudioContext runs at a
-/// different device rate the push path linearly resamples, so the
-/// contract and the real-time consumption rate (48,000 frames per second)
-/// hold on every device.
+/// Input likewise prefers an AudioWorkletProcessor that resamples to the
+/// 48 kHz contract on the rendering thread and posts transferable chunks;
+/// the ScriptProcessorNode fallback delivers at the context rate (reported
+/// honestly by [getFormat]).
 ///
 /// The microphone is only requested once [inputAudioStream] is listened
 /// to: output-only users never trigger a permission prompt.
-class AudioIoWeb implements AudioIoImpl {
+class AudioIoWeb extends AudioIoImpl {
   static const double _contractSampleRate = 48000;
 
   // ScriptProcessorNode runs on the main thread; small buffers glitch as
@@ -166,12 +315,17 @@ class AudioIoWeb implements AudioIoImpl {
 
   // AudioWorklet renders in fixed quanta of 128 frames.
   static const int _workletQuantumFrames = 128;
-  static const String _workletProcessorName = 'audio-io-output';
+  static const String _outputProcessorName = 'audio-io-output';
+  static const String _inputProcessorName = 'audio-io-input';
+  static const int _minInputChunkFrames = 128;
+  static const int _maxInputChunkFrames = 4096;
 
   AudioContext? _audioContext;
   Future<void>? _startInFlight;
   AudioWorkletNodeJs? _workletNode;
+  AudioWorkletNodeJs? _inputWorkletNode;
   String? _workletUrl;
+  bool _workletModuleLoaded = false;
   ScriptProcessorNode? _scriptProcessor;
   StreamController<List<double>>? _inputController;
   StreamController<List<double>>? _outputController;
@@ -191,6 +345,13 @@ class AudioIoWeb implements AudioIoImpl {
   @override
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
 
+  @override
+  Sink<Uint8List>? pcm16OutputSink(int sourceRate) {
+    final node = _workletNode;
+    if (node == null) return null;
+    return _WorkletPcm16Sink(node.port, sourceRate);
+  }
+
   // ScriptProcessorNode requires a power of two between 256 and 16384;
   // anything below 2048 glitches on the main thread.
   int _calculateBufferSize(double sampleRate) {
@@ -208,10 +369,16 @@ class AudioIoWeb implements AudioIoImpl {
   }
 
   int _calculateRingFrames() {
-    final requested =
-        (_requestedFrameDuration * _contractSampleRate * _ringDurationMultiplier)
-            .round();
+    final requested = (_requestedFrameDuration *
+            _contractSampleRate *
+            _ringDurationMultiplier)
+        .round();
     return requested > _minRingFrames ? requested : _minRingFrames;
+  }
+
+  int _calculateInputChunkFrames() {
+    final requested = (_requestedFrameDuration * _contractSampleRate).round();
+    return requested.clamp(_minInputChunkFrames, _maxInputChunkFrames);
   }
 
   /// Concurrent calls share one start attempt: the web fires a lifecycle
@@ -245,7 +412,7 @@ class AudioIoWeb implements AudioIoImpl {
       );
       _outputController = StreamController<List<double>>();
 
-      final workletStarted = await _tryStartWorkletOutput(sampleRate);
+      final workletStarted = await _tryStartWorkletOutput();
       if (!workletStarted) {
         _startScriptProcessorOutput(sampleRate);
       }
@@ -263,7 +430,7 @@ class AudioIoWeb implements AudioIoImpl {
   /// Loads the worklet module from a Blob URL and wires the output stream
   /// to its message port. Returns false (after cleaning up) on browsers
   /// without AudioWorklet support so the caller can fall back.
-  Future<bool> _tryStartWorkletOutput(double sampleRate) async {
+  Future<bool> _tryStartWorkletOutput() async {
     try {
       final blob = web.Blob(
         [_workletSource.toJS].toJS,
@@ -272,18 +439,17 @@ class AudioIoWeb implements AudioIoImpl {
       final url = web.URL.createObjectURL(blob);
       _workletUrl = url;
       await _audioContext!.audioWorklet.addModule(url).toDart;
+      _workletModuleLoaded = true;
 
-      final node = AudioWorkletNodeJs(_audioContext!, _workletProcessorName)
+      final node = AudioWorkletNodeJs(_audioContext!, _outputProcessorName)
         ..connect(_audioContext!.destination);
       _workletNode = node;
 
-      final resampler =
-          PushResampler(_contractSampleRate.toInt(), sampleRate.round());
       _outputController!.stream.listen((data) {
-        final converted = resampler.process(data);
-        if (converted.isNotEmpty) {
-          node.port.postMessage(converted.toJS);
-        }
+        if (data.isEmpty) return;
+        final converted = Float32List.fromList(data);
+        _postSamples(node.port, _Formats.float32, converted.buffer, 0,
+            converted.length, _contractSampleRate.toInt());
       });
       return true;
     } catch (e) {
@@ -315,8 +481,7 @@ class AudioIoWeb implements AudioIoImpl {
 
       final input = _inputController;
       if (_inputRequested && input != null && input.hasListener) {
-        final inputData = audioEvent.inputBuffer.getChannelData(0).toDart;
-        input.add(List<double>.from(inputData));
+        _addInputCopy(input, audioEvent.inputBuffer);
       }
     }).toJS;
 
@@ -325,9 +490,21 @@ class AudioIoWeb implements AudioIoImpl {
     _scriptProcessor = processor;
   }
 
+  /// Copies one capture buffer into the input stream. The copy is required
+  /// (the browser reuses the AudioBuffer) but stays typed end to end:
+  /// Float32List implements List<double>, so no per-sample boxing occurs.
+  void _addInputCopy(
+      StreamController<List<double>> controller, AudioBuffer inputBuffer) {
+    final view = inputBuffer.getChannelData(0).toDart;
+    controller.add(Float32List.fromList(view));
+  }
+
   void _releaseWorklet() {
     _workletNode?.disconnect();
     _workletNode = null;
+    _inputWorkletNode?.disconnect();
+    _inputWorkletNode = null;
+    _workletModuleLoaded = false;
     final url = _workletUrl;
     if (url != null) {
       web.URL.revokeObjectURL(url);
@@ -343,21 +520,44 @@ class AudioIoWeb implements AudioIoImpl {
     final context = _audioContext;
     if (mediaStream == null || context == null) return;
 
-    final processor = _scriptProcessor ?? _createInputProcessor(context);
-    context.createMediaStreamSource(mediaStream).connect(processor);
+    final source = context.createMediaStreamSource(mediaStream);
+    if (_workletModuleLoaded) {
+      source.connectWorklet(_createInputWorkletNode(context));
+      return;
+    }
+    source.connect(_scriptProcessor ?? _createInputProcessor(context));
   }
 
-  /// Input-only ScriptProcessorNode used when output runs in the worklet.
-  /// It must be connected to the destination to fire, but it never writes
-  /// to its output buffer, so it contributes only silence.
+  /// Input AudioWorkletNode: resamples to the 48 kHz contract on the audio
+  /// rendering thread and posts transferable chunks, so the main-thread
+  /// cost per chunk is adopting an already-transferred Float32List.
+  AudioWorkletNodeJs _createInputWorkletNode(AudioContext context) {
+    final processorOptions = JSObject()
+      ..['targetRate'] = _contractSampleRate.toInt().toJS
+      ..['chunkFrames'] = _calculateInputChunkFrames().toJS;
+    final options = JSObject()..['processorOptions'] = processorOptions;
+
+    final node = AudioWorkletNodeJs(context, _inputProcessorName, options)
+      ..connect(context.destination);
+    node.port.onmessage = ((web.MessageEvent event) {
+      final controller = _inputController;
+      if (controller == null || !controller.hasListener) return;
+      controller.add((event.data! as JSFloat32Array).toDart);
+    }).toJS;
+    _inputWorkletNode = node;
+    return node;
+  }
+
+  /// Input-only ScriptProcessorNode used when the worklet module failed to
+  /// load. It must be connected to the destination to fire, but it never
+  /// writes to its output buffer, so it contributes only silence.
   ScriptProcessorNode _createInputProcessor(AudioContext context) {
     final processor = context.createScriptProcessor(_bufferSize, 1, 1);
     processor.onaudioprocess = ((JSAny event) {
       final audioEvent = event as AudioProcessingEvent;
       final input = _inputController;
       if (input != null && input.hasListener) {
-        final inputData = audioEvent.inputBuffer.getChannelData(0).toDart;
-        input.add(List<double>.from(inputData));
+        _addInputCopy(input, audioEvent.inputBuffer);
       }
     }).toJS;
     processor.connect(context.destination);
@@ -416,11 +616,14 @@ class AudioIoWeb implements AudioIoImpl {
   @override
   Map<String, dynamic> getFormat() {
     final deviceSampleRate = _audioContext?.sampleRate ?? _contractSampleRate;
+    final inputSampleRate =
+        _workletModuleLoaded ? _contractSampleRate : deviceSampleRate;
     return {
       'input': {
         'type': 'double',
         'channels': 1,
-        'sampleRate': _contractSampleRate,
+        'sampleRate': inputSampleRate,
+        'backend': _workletModuleLoaded ? 'audioWorklet' : 'scriptProcessor',
       },
       'output': {
         'type': 'double',

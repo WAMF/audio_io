@@ -3,12 +3,15 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'src/audio_io_threading.dart';
 import 'src/pcm16_adapters.dart';
 
 // Conditional imports for platform-specific implementations
 import 'src/audio_io_stub.dart'
     if (dart.library.io) 'src/audio_io_native.dart'
     if (dart.library.js_interop) 'src/audio_io_web.dart' as impl;
+
+export 'src/audio_io_threading.dart';
 
 class _Methods {
   static const start = 'start';
@@ -91,6 +94,7 @@ class AudioIoConfig {
     this.sampleRate = AudioIoSampleRate.rate48000,
     this.format = AudioIoFormat.float64,
     this.latency = AudioIoLatency.Balanced,
+    this.threading = AudioIoThreading.mainIsolate,
   });
 
   /// Rate the [AudioIo.inputBytes] / [AudioIo.outputBytes] streams use.
@@ -101,6 +105,10 @@ class AudioIoConfig {
 
   /// Callback latency preset.
   final AudioIoLatency latency;
+
+  /// Where the audio transport runs; see [AudioIoThreading]. Optional:
+  /// defaults to the main isolate, which every platform supports.
+  final AudioIoThreading threading;
 }
 
 class AudioIo {
@@ -172,7 +180,8 @@ class AudioIo {
     _outputSubscription = _outputController.stream.listen((output) {
       final buffer =
           output is Float64List ? output : Float64List.fromList(output);
-      final outData = ByteData.view(buffer.buffer);
+      final outData = ByteData.view(
+          buffer.buffer, buffer.offsetInBytes, buffer.lengthInBytes);
       ServicesBinding.instance.defaultBinaryMessenger
           .send(_Channels.audioOutput, outData);
     });
@@ -204,6 +213,7 @@ class AudioIo {
   /// [input] / [output] unchanged.
   Future<void> startWith(AudioIoConfig config) async {
     _config = config;
+    _impl.configureThreading(config.threading);
     await requestLatency(config.latency);
     await start();
     if (config.format == AudioIoFormat.pcm16) {
@@ -221,6 +231,8 @@ class AudioIo {
       outputEngineRate: outputRate,
       inputAudio: input,
       outputAudio: output,
+      directOutputBytes:
+          _impl.usePlatformImpl ? _impl.pcm16OutputSink(streamRate) : null,
     );
   }
 

@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:audio_io/audio_io.dart';
 import 'package:audio_io/src/pcm16_adapters.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -57,6 +57,30 @@ void main() {
       adapters.dispose();
     });
 
+    test('directOutputBytes bypasses the Dart decode/resample path', () async {
+      final adapters = Pcm16Adapters();
+      final forwarded = <Uint8List>[];
+      final engineSamples = <List<double>>[];
+      engineOutput.stream.listen(engineSamples.add);
+
+      await adapters.wire(
+        streamRate: AudioIoSampleRate.rate16000.hz,
+        inputEngineRate: 48000,
+        outputEngineRate: 48000,
+        inputAudio: engineInput.stream,
+        outputAudio: engineOutput.sink,
+        directOutputBytes: _CollectingSink(forwarded),
+      );
+
+      final bytes = Uint8List.fromList([1, 2, 3, 4]);
+      adapters.outputBytes.add(bytes);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(forwarded, [bytes]);
+      expect(engineSamples, isEmpty);
+      adapters.dispose();
+    });
+
     test('outputBytes is a reusable broadcast sink across restarts', () async {
       final adapters = Pcm16Adapters();
       // The same sink reference stays valid across a restart because the
@@ -73,9 +97,37 @@ void main() {
 
   group('AudioIo', () {
     test('clearOutput dispatch completes without a started engine', () async {
+      // The host test runner has no platform plugin registered; a mock
+      // handler stands in so the dispatch path itself is what's exercised.
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+        const MethodChannel('com.wearemobilefirst.audio_io'),
+        (call) async => null,
+      );
+
       final audio = AudioIo();
       await expectLater(audio.clearOutput(), completes);
       audio.dispose();
     });
+
+    test('config carries the optional threading mode', () {
+      const defaulted = AudioIoConfig();
+      const isolated = AudioIoConfig(threading: AudioIoThreading.audioIsolate);
+
+      expect(defaulted.threading, AudioIoThreading.mainIsolate);
+      expect(isolated.threading, AudioIoThreading.audioIsolate);
+    });
   });
+}
+
+class _CollectingSink implements Sink<Uint8List> {
+  _CollectingSink(this.collected);
+
+  final List<Uint8List> collected;
+
+  @override
+  void add(Uint8List data) => collected.add(data);
+
+  @override
+  void close() {}
 }

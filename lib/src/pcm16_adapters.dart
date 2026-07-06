@@ -38,12 +38,17 @@ class Pcm16Adapters {
   /// Float64 streams. [streamRate] is the rate callers see on the byte
   /// streams; [inputEngineRate] / [outputEngineRate] are the engine's actual
   /// capture/render rates. Re-callable: cancels any prior subscriptions first.
+  ///
+  /// When [directOutputBytes] is provided (a back end that decodes and
+  /// resamples PCM16 natively, like the web AudioWorklet), output bytes are
+  /// forwarded to it untouched and the Dart-side decode/resample is skipped.
   Future<void> wire({
     required int streamRate,
     required int inputEngineRate,
     required int outputEngineRate,
     required Stream<List<double>> inputAudio,
     required Sink<List<double>> outputAudio,
+    Sink<Uint8List>? directOutputBytes,
   }) async {
     _outputResampler = PushResampler(streamRate, outputEngineRate);
     _inputResampler = PushResampler(inputEngineRate, streamRate);
@@ -51,10 +56,12 @@ class Pcm16Adapters {
     final outputBytesController =
         _outputBytesController ??= StreamController<Uint8List>.broadcast();
     await _outputBytesSubscription?.cancel();
-    _outputBytesSubscription = outputBytesController.stream.listen((bytes) {
-      final samples = pcm16BytesToFloat64(bytes);
-      outputAudio.add(_outputResampler!.process(samples));
-    });
+    _outputBytesSubscription = directOutputBytes != null
+        ? outputBytesController.stream.listen(directOutputBytes.add)
+        : outputBytesController.stream.listen((bytes) {
+            final samples = pcm16BytesToFloat64(bytes);
+            outputAudio.add(_outputResampler!.process(samples));
+          });
 
     final inputBytesController =
         _inputBytesController ??= StreamController<Uint8List>.broadcast();
