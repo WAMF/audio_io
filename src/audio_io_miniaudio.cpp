@@ -27,7 +27,10 @@ const int AUDIO_FORMAT_PCM16 = 1;
 // most two segments instead of per-sample modulo arithmetic.
 //
 // clear() only requests a clear: the consumer applies it at its next read,
-// because tail belongs exclusively to the consumer.
+// because tail belongs exclusively to the consumer. The request captures
+// the head position at clear time, so samples written AFTER the request
+// survive - a barge-in that clears and immediately queues the next
+// response must not clip that response's start.
 template <typename T>
 class RingBuffer {
 private:
@@ -37,6 +40,7 @@ private:
     std::atomic<uint64_t> head{0};
     std::atomic<uint64_t> tail{0};
     std::atomic<bool> clearRequested{false};
+    std::atomic<uint64_t> clearUpTo{0};
 
     static size_t nextPow2(size_t value) {
         size_t result = 1;
@@ -65,8 +69,10 @@ public:
 
     size_t read(T* data, size_t count) {
         if (clearRequested.exchange(false, std::memory_order_acq_rel)) {
-            tail.store(head.load(std::memory_order_acquire),
-                       std::memory_order_release);
+            const uint64_t target = clearUpTo.load(std::memory_order_acquire);
+            if (target > tail.load(std::memory_order_relaxed)) {
+                tail.store(target, std::memory_order_release);
+            }
         }
         const uint64_t t = tail.load(std::memory_order_relaxed);
         const uint64_t h = head.load(std::memory_order_acquire);
@@ -81,6 +87,8 @@ public:
     }
 
     void clear() {
+        clearUpTo.store(head.load(std::memory_order_acquire),
+                        std::memory_order_release);
         clearRequested.store(true, std::memory_order_release);
     }
 

@@ -7,9 +7,11 @@ import 'ffi/audio_io_ffi.dart';
 import 'ffi/audio_io_isolate.dart';
 
 class AudioIoNative extends AudioIoImpl {
+  static const double _defaultFrameDuration = 0.003;
+
   AudioIoFFITransport? _transport;
   AudioIoThreading _threading = AudioIoThreading.mainIsolate;
-  double? _pendingFrameDuration;
+  double? _requestedFrameDuration;
 
   @override
   bool get usePlatformImpl =>
@@ -38,10 +40,12 @@ class AudioIoNative extends AudioIoImpl {
     _transport ??=
         wantIsolate ? AudioIoFFIIsolateProxy() : AudioIoFFI.instance;
 
-    final pending = _pendingFrameDuration;
-    if (pending != null) {
-      await _transport!.requestFrameDuration(pending);
-      _pendingFrameDuration = null;
+    // Re-applied on every start so a requested duration survives a
+    // threading-mode transport swap (a fresh transport starts from its own
+    // default, not the duration applied to the discarded one).
+    final requested = _requestedFrameDuration;
+    if (requested != null) {
+      await _transport!.requestFrameDuration(requested);
     }
     await _transport!.start();
   }
@@ -63,17 +67,15 @@ class AudioIoNative extends AudioIoImpl {
 
   @override
   Future<void> requestFrameDuration(double duration) async {
-    final transport = _transport;
-    if (transport != null) {
-      await transport.requestFrameDuration(duration);
-      return;
-    }
-    _pendingFrameDuration = duration;
+    _requestedFrameDuration = duration;
+    await _transport?.requestFrameDuration(duration);
   }
 
   @override
   Future<double> getFrameDuration() async {
-    return await _transport?.getFrameDuration() ?? 0.01;
+    return await _transport?.getFrameDuration() ??
+        _requestedFrameDuration ??
+        _defaultFrameDuration;
   }
 }
 
