@@ -31,8 +31,6 @@ flutter:
       macos:
         pluginClass: AudioIoPlugin
       android:
-        package: com.wearemobilefirst.audio_io
-        pluginClass: AudioIoPlugin
         ffiPlugin: true
       web:
         pluginClass: AudioIoPlugin

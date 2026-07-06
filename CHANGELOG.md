@@ -31,6 +31,12 @@
   requested before the first `start()` was silently dropped.
 - `pcm16BytesToFloat64` / `float64ToPcm16Bytes` use typed-array views on
   little-endian hosts instead of per-sample `ByteData` calls.
+- Android: the plugin is now declared FFI-only (`ffiPlugin: true` without a
+  `pluginClass`). The previous declaration referenced a Kotlin plugin class
+  that does not exist, which newer Flutter versions reject as a deleted
+  Android v1 embedding plugin. The plugin build also moved to
+  `compileSdk 35` and no longer applies its own Kotlin plugin
+  (Flutter built-in Kotlin compatibility).
 
 ## 0.4.1
 
