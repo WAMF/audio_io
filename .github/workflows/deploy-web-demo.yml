@@ -28,7 +28,6 @@ jobs:
       - name: Build Gemini Live web demo
         working-directory: example_gemini_live
         run: |
-          flutter create --platforms=web .
           flutter pub get
           flutter build web --release --base-href /audio_io/
 
