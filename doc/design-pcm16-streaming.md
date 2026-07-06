@@ -1,7 +1,16 @@
 # Design: PCM16 Streaming, Configurable Sample Rates & Frame Chunking
 
 **Issue:** #6 — Support PCM16 streaming (16kHz/24kHz) + low-latency chunked duplex audio for real-time AI  
-**Status:** Draft
+**Status:** Shipped in 0.4.0 (historical design document)
+
+> **Where the implementation diverged:** conversion and resampling did NOT
+> land on the native side as proposed below. The shipped design does both in
+> Dart adapters (`lib/src/pcm16_adapters.dart`, `pcm16_codec.dart`,
+> `push_resampler.dart`) over the engine's fixed 48 kHz Float64 contract; on
+> web since 0.5.0 they run inside the output AudioWorklet on the audio
+> rendering thread. The native FFI backend gained a PCM16 mode
+> (`audio_io_create_with_config`) that the Dart layer does not currently use.
+> Native-side conversion for iOS/macOS is revisited in issue #27.
 
 ---
 
