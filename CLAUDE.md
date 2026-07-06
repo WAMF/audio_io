@@ -122,13 +122,9 @@ flutter run -d chrome
   (ios/audio_io/Sources/audio_io/SwiftAudioIoPlugin.swift and
   macos/audio_io/Sources/audio_io/AudioIoPlugin.swift)
 - FFI platforms: `audio_io_create_with_config` in src/audio_io_miniaudio.cpp
-- Web: `_contractSampleRate` and the worklet source in
-  lib/src/audio_io_web.dart
-- Update the Dart side if changing from mono/48kHz
-
 ### Debugging Audio Issues
 - Check audio session category/mode in iOS Console
 - Monitor ring buffer fill levels for underruns (`OutputRing.droppedFrames`
   on web fallback; `getFormat()` reports the active backend)
 - Use AVAudioEngine tap points for debugging on Apple platforms
-- iOS/macOS FFI transport (escaping the root isolate) is tracked in issue #27
+- iOS/macOS platform-channel transport (escaping the root isolate) is tracked in issue `#27`
