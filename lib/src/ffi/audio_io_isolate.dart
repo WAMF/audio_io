@@ -21,6 +21,10 @@ class _Protocol {
 
 /// Entry point of the dedicated audio isolate: runs an [AudioIoFFICore]
 /// (FFI is usable from any isolate) and speaks the [_Protocol] messages.
+///
+/// Every command is guarded: an unhandled throw would kill the isolate with
+/// no error path back to the proxy, so failures are forwarded as
+/// [_Protocol.error] events instead.
 void _audioIsolateMain((SendPort ready, SendPort events) ports) {
   final (ready, events) = ports;
   final commands = ReceivePort();
@@ -29,33 +33,36 @@ void _audioIsolateMain((SendPort ready, SendPort events) ports) {
   final core = AudioIoFFICore();
 
   commands.listen((dynamic message) {
-    final command = (message as List<dynamic>)[0] as String;
-    switch (command) {
-      case _Protocol.start:
-        core.setFrameDuration(message[1] as double);
-        try {
-          core.start((frames) => events.send([_Protocol.input, frames]));
-          events.send([
-            _Protocol.state,
-            core.getFormat(),
-            core.getFrameDuration(),
-          ]);
-        } on Exception catch (e) {
-          events.send([_Protocol.error, e.toString()]);
-        }
-      case _Protocol.write:
-        core.write(message[1] as Float64List);
-      case _Protocol.clearOutput:
-        core.clearOutput();
-      case _Protocol.setFrameDuration:
-        core.setFrameDuration(message[1] as double);
-        events
-            .send([_Protocol.state, core.getFormat(), core.getFrameDuration()]);
-      case _Protocol.stop:
-        core.stop();
-        events.send([_Protocol.stopped]);
+    try {
+      _handleCommand(core, events, message as List<dynamic>);
+    } on Object catch (e) {
+      events.send([_Protocol.error, e.toString()]);
     }
   });
+}
+
+void _handleCommand(
+    AudioIoFFICore core, SendPort events, List<dynamic> message) {
+  final command = message[0] as String;
+  switch (command) {
+    case _Protocol.start:
+      core.setFrameDuration(message[1] as double);
+      core.start((frames) => events.send([_Protocol.input, frames]));
+      events.send([_Protocol.state, core.getFormat(), core.getFrameDuration()]);
+    case _Protocol.write:
+      core.write(message[1] as Float64List);
+    case _Protocol.clearOutput:
+      core.clearOutput();
+    case _Protocol.setFrameDuration:
+      core.setFrameDuration(message[1] as double);
+      events.send([_Protocol.state, core.getFormat(), core.getFrameDuration()]);
+    case _Protocol.stop:
+      try {
+        core.stop();
+      } finally {
+        events.send([_Protocol.stopped]);
+      }
+  }
 }
 
 /// Dedicated-isolate FFI transport: device polling and native buffer copies
@@ -66,7 +73,9 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
   Isolate? _isolate;
   SendPort? _commands;
   ReceivePort? _events;
+  ReceivePort? _control;
   StreamSubscription<dynamic>? _eventsSubscription;
+  StreamSubscription<dynamic>? _controlSubscription;
 
   StreamController<List<double>>? _inputController;
   StreamController<List<double>>? _outputController;
@@ -94,9 +103,18 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
     _events = events;
     _eventsSubscription = events.listen(_handleEvent);
 
+    // Crash signals arrive on their own port so they never mix with the
+    // [_Protocol] message parsing; an intentional teardown cancels this
+    // subscription before killing the isolate.
+    final control = ReceivePort();
+    _control = control;
+    _controlSubscription = control.listen(_handleCrash);
+
     _isolate = await Isolate.spawn(
       _audioIsolateMain,
       (ready.sendPort, events.sendPort),
+      onError: control.sendPort,
+      onExit: control.sendPort,
       debugName: 'audio_io',
     );
     _commands = await ready.first as SendPort;
@@ -165,15 +183,44 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
         _startCompleter?.complete();
         _startCompleter = null;
       case _Protocol.error:
-        _startCompleter?.completeError(Exception(message[1] as String));
-        _startCompleter = null;
+        _reportError(Exception(message[1] as String));
       case _Protocol.stopped:
         _stopCompleter?.complete();
         _stopCompleter = null;
     }
   }
 
+  /// Routes a worker failure to whoever can observe it: a pending start
+  /// awaits the error directly; afterwards it surfaces on the input stream.
+  void _reportError(Object error) {
+    final startCompleter = _startCompleter;
+    if (startCompleter != null) {
+      _startCompleter = null;
+      startCompleter.completeError(error);
+      return;
+    }
+    _inputController?.addError(error);
+  }
+
+  /// Handles uncaught-error and unexpected-exit signals from the isolate
+  /// itself. Anything arriving here means the worker is gone: fail pending
+  /// waits, surface the error, and tear down.
+  void _handleCrash(dynamic message) {
+    final error = message is List && message.isNotEmpty && message[0] != null
+        ? Exception('audio_io isolate error: ${message[0]}')
+        : Exception('audio_io isolate exited unexpectedly');
+    _isRunning = false;
+    _reportError(error);
+    _stopCompleter?.complete();
+    _stopCompleter = null;
+    unawaited(_teardown());
+  }
+
   Future<void> _teardown() async {
+    await _controlSubscription?.cancel();
+    _controlSubscription = null;
+    _control?.close();
+    _control = null;
     await _eventsSubscription?.cancel();
     _eventsSubscription = null;
     _events?.close();
