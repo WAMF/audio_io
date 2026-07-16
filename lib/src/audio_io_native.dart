@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'audio_io_apple.dart';
 import 'audio_io_stub.dart';
 import 'audio_io_threading.dart';
 import 'ffi/audio_io_ffi.dart';
@@ -79,4 +80,8 @@ class AudioIoNative extends AudioIoImpl {
   }
 }
 
-AudioIoImpl createAudioIoImpl() => AudioIoNative();
+/// iOS/macOS use the AVAudioEngine backend (method-channel control plane +
+/// FFI data plane, issue #27); the other `dart:io` platforms use the miniaudio
+/// FFI backend.
+AudioIoImpl createAudioIoImpl() =>
+    (Platform.isIOS || Platform.isMacOS) ? AudioIoApple() : AudioIoNative();

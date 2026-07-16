@@ -1,3 +1,16 @@
+## Unreleased
+
+- iOS/macOS: the audio data plane now runs over FFI on the AVAudioEngine ring
+  buffers instead of `FlutterBinaryMessenger`. `AudioIoThreading.audioIsolate`
+  now works on iOS and macOS (the transport can run off the root isolate);
+  previously Apple platforms silently fell back to the main isolate because
+  platform→Dart pushed channel messages only deliver to the root isolate. The
+  engine lifecycle (start/stop/permissions/latency/format) stays on the method
+  channel. Removed the input/output binary channels, the `DataBufferPool`, and
+  the main-thread dispatch and per-sample Float64 conversion from the realtime
+  sink render block — capture is now Float32 straight into a lock-free ring.
+  Public API unchanged.
+
 ## 0.5.0
 
 - Optional dedicated audio isolate: `AudioIoConfig.threading:

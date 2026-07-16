@@ -164,9 +164,10 @@ in the browser at [wamf.github.io/audio_io](https://wamf.github.io/audio_io/).
 ### Threading (optional dedicated audio isolate)
 
 By default the audio transport runs on the main isolate, which suits most
-apps and every platform. On the FFI back ends (Android, Windows, Linux) you
-can opt into a dedicated audio isolate so device polling and native buffer
-copies are unaffected by main-isolate jank (heavy widget builds, GC):
+apps and every platform. On the FFI back ends (Android, Windows, Linux) and
+on iOS/macOS you can opt into a dedicated audio isolate so device polling and
+native buffer copies are unaffected by main-isolate jank (heavy widget
+builds, GC):
 
 ```dart
 await audioIo.startWith(const AudioIoConfig(
@@ -174,10 +175,12 @@ await audioIo.startWith(const AudioIoConfig(
 ));
 ```
 
-Platforms without dedicated-isolate support (iOS, macOS, web) silently fall
-back to main-isolate operation. The `input` / `output` streams still surface
-on the main isolate in both modes, so listener callbacks run there; move
-heavy DSP out of the listener if it competes with UI work.
+iOS and macOS reach the AVAudioEngine ring buffers over FFI (the engine
+lifecycle stays on the method channel), so the data plane can run on the
+audio isolate just like the FFI back ends. Web silently falls back to
+main-isolate operation. The `input` / `output` streams still surface on the
+main isolate in every mode, so listener callbacks run there; move heavy DSP
+out of the listener if it competes with UI work.
 
 ## Audio Format
 

@@ -43,14 +43,23 @@ flutter run -d chrome
 ### Plugin Structure
 - **lib/audio_io.dart**: Public API — singleton `AudioIo`, `AudioIoConfig`
   (`startWith`), Float64 `input`/`output` streams, PCM16 `inputBytes`/`outputBytes`,
-  `clearOutput`, latency and threading options. iOS/macOS transport (binary
-  platform channels) also lives here.
+  `clearOutput`, latency and threading options. A thin facade: every platform
+  routes through an `AudioIoImpl`.
 - **lib/src/**: Internals
   - `audio_io_stub.dart` / `audio_io_native.dart` / `audio_io_web.dart`: the
-    conditional `AudioIoImpl` implementations
+    conditional `AudioIoImpl` implementations. `audio_io_native.dart` picks
+    the Apple backend (`audio_io_apple.dart`) on iOS/macOS and the miniaudio
+    FFI backend elsewhere.
+  - `audio_io_apple.dart`: iOS/macOS `AudioIoImpl` — composes the
+    method-channel control plane (start/stop/permissions/latency/format) with
+    the FFI data plane, honoring `configureThreading`
   - `ffi/audio_io_ffi.dart`: FFI transport for Android/Windows/Linux —
     `AudioIoFFICore` (handle, drain-all polling, persistent native buffers)
     behind the `AudioIoFFITransport` interface
+  - `ffi/audio_io_apple_ffi.dart` / `ffi/audio_io_apple_isolate.dart`: the
+    Apple FFI data plane — `AudioIoAppleCore` (drain-all poll over the
+    `@_cdecl` ring exports, Float32 input) and its main-isolate and
+    dedicated-isolate transports
   - `ffi/audio_io_isolate.dart`: opt-in dedicated audio isolate transport
     (`AudioIoThreading.audioIsolate`), with worker guards and crash handling
   - `pcm16_adapters.dart` / `pcm16_codec.dart` / `push_resampler.dart` /
@@ -58,8 +67,11 @@ flutter run -d chrome
 - **ios/audio_io/Sources/audio_io/** and **macos/audio_io/Sources/audio_io/**:
   Swift sources in the Flutter Swift Package layout (dual SwiftPM + CocoaPods;
   the podspecs point at the same sources). AVAudioEngine pipeline;
-  `AudioOutputRing.swift` is shared between the platforms. iOS uses
-  voice-processing I/O for echo cancellation.
+  `AudioOutputRing.swift` (Float64 playback) and `AudioInputRing.swift`
+  (Float32 capture) are shared between the platforms (the macOS copies are
+  symlinks). The realtime sink render block writes captured Float32 straight
+  into the input ring; `@_cdecl` exports (`audio_io_apple_*`) expose both
+  rings to Dart FFI. Engine lifecycle stays on the method channel.
 - **src/audio_io_miniaudio.cpp**: miniaudio backend for Android/Windows/Linux.
   Lock-free SPSC ring buffers (atomics + bulk memcpy), preallocated scratch —
   the realtime callback must never lock or allocate.
@@ -67,9 +79,12 @@ flutter run -d chrome
   no platform plugin classes.
 
 ### Audio Pipeline
-1. **iOS/macOS**: Mic → AVAudioEngine sink → Float64 over binary channel →
-   Dart stream; output stream → binary channel → `AudioOutputRing` →
-   AVAudioSourceNode (pinned to the 48 kHz mono Float64 contract).
+1. **iOS/macOS**: Mic → AVAudioEngine sink → `AudioInputRing` (Float32) →
+   Dart FFI poll → stream; output stream → Dart FFI write → `AudioOutputRing`
+   → AVAudioSourceNode (pinned to the 48 kHz mono Float64 contract). Engine
+   lifecycle (start/stop/permissions/latency/format) runs on the method
+   channel; only the sample data plane crosses FFI, so the poll/write loop can
+   run on a dedicated audio isolate.
 2. **FFI platforms**: miniaudio duplex callback ↔ lock-free rings ↔ Dart
    poll/write via FFI (5 ms drain-all poll), optionally on a dedicated isolate.
 3. **Web**: AudioWorklet output ring drained on the audio rendering thread;
@@ -127,4 +142,8 @@ flutter run -d chrome
 - Monitor ring buffer fill levels for underruns (`OutputRing.droppedFrames`
   on web fallback; `getFormat()` reports the active backend)
 - Use AVAudioEngine tap points for debugging on Apple platforms
-- iOS/macOS platform-channel transport (escaping the root isolate) is tracked in issue `#27`
+- iOS/macOS data plane is FFI over the AVAudioEngine rings (`#27`); the
+  `@_cdecl` exports (`audio_io_apple_*`) must stay visible to
+  `DynamicLibrary.process()` in both CocoaPods and SwiftPM builds — a stripped
+  symbol shows up as a `lookupFunction` failure at `start()`, not a compile
+  error
