@@ -15,6 +15,7 @@ Try the PCM16 streaming + Gemini Live example in your browser:
 - Cross-platform support (iOS, macOS, Android, Web, Linux, Windows)
 - Simple Stream-based API
 - PCM16 byte streams at 16/24/48 kHz for realtime voice APIs (e.g. Gemini Live)
+- System-audio (loopback) capture on Windows — record what the machine is playing
 - Configurable audio latency modes
 - Optional dedicated audio isolate on FFI platforms
 - Consistent data format across all platforms (Float64, 48kHz, mono)
@@ -219,6 +220,55 @@ On desktop `AudioIoInputSource.systemAudio` is backed by WASAPI loopback
 (Windows) and Core Audio process taps (macOS); it throws the same
 `isSystemAudioUnsupported` error on platforms/back ends that cannot provide
 it. See the `example/` app for a share-a-tab listening demo.
+
+### System audio capture (loopback)
+
+By default the input stream captures the microphone. Set
+`inputSource: AudioIoInputSource.systemAudio` to instead capture the machine's
+audio mix — what is currently playing out of the speakers (meetings, media,
+other apps). The captured frames arrive on the same `input` / `inputBytes`
+stream, downmixed to mono and resampled to the configured rate, so consumers
+are unchanged.
+
+```dart
+await audioIo.startWith(const AudioIoConfig(
+  inputSource: AudioIoInputSource.systemAudio,
+));
+```
+
+| Platform | System audio | Mechanism |
+|----------|--------------|-----------|
+| Windows  | ✅ Supported | WASAPI loopback (`ma_device_type_loopback`) |
+| macOS    | ✅ Supported | Core Audio process taps (macOS 14.2+) |
+| Linux    | ⛔ Not yet | PulseAudio/PipeWire monitor sources — planned |
+| Android / iOS / Web | ⛔ Not supported | — |
+
+**Own-process exclusion.** On Windows the host process is excluded from the
+loopback capture (`wasapi.loopbackProcessID` + `loopbackProcessExclude`), so an
+app that plays TTS through the output stream while capturing system audio does
+**not** hear itself. The output stream keeps working in this mode: because a
+WASAPI loopback device is capture-only, a separate playback device is opened
+alongside it.
+
+**No permission prompt** is required for loopback capture on Windows.
+
+**Unsupported platforms** throw an `AudioIoException` with
+`isSystemAudioUnsupported == true` from `startWith` rather than crashing the
+engine, so callers can fall back to the microphone:
+
+```dart
+try {
+  await audioIo.startWith(
+    const AudioIoConfig(inputSource: AudioIoInputSource.systemAudio),
+  );
+} on AudioIoException catch (e) {
+  if (e.isSystemAudioUnsupported) {
+    await audioIo.startWith(const AudioIoConfig()); // microphone fallback
+  } else {
+    rethrow;
+  }
+}
+```
 
 ## Audio Format
 

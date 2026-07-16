@@ -12,10 +12,20 @@
 #include <android/log.h>
 #endif
 
+#if defined(_WIN32)
+// GetCurrentProcessId, used to exclude our own process from WASAPI loopback
+// capture so an app playing TTS through the output stream does not hear itself.
+#include <windows.h>
+#endif
+
 const int CHANNELS = 1;
 
 const int AUDIO_FORMAT_FLOAT64 = 0;
 const int AUDIO_FORMAT_PCM16 = 1;
+
+// Input source selector, mirrored by AudioIoInputSource.index on the Dart side.
+const int INPUT_SOURCE_MICROPHONE = 0;
+const int INPUT_SOURCE_SYSTEM_AUDIO = 1;
 
 // Single-producer single-consumer lock-free ring buffer.
 //
@@ -117,20 +127,34 @@ const size_t SCRATCH_FRAMES = 8192;
 
 struct AudioContext {
     ma_device device;
+    // System-audio (loopback) mode uses a second, playback-only device so the
+    // output stream keeps working: a WASAPI loopback device is capture-only
+    // and cannot carry a playback side. Unused in microphone (duplex) mode.
+    ma_device playbackDevice;
+    bool hasPlaybackDevice;
     DoubleRingBuffer* inputRingBuffer;
     DoubleRingBuffer* outputRingBuffer;
     Int16RingBuffer* inputRingBufferPcm16;
     Int16RingBuffer* outputRingBufferPcm16;
+    // The capture (input) and playback (output) conversions get their own
+    // scratch buffers. In microphone/duplex mode a single callback fills both
+    // in sequence; in loopback mode the capture and playback devices run on
+    // separate realtime threads, so sharing one scratch buffer would be a data
+    // race. Splitting them is safe in both modes.
     std::vector<double> scratchDouble;
     std::vector<int16_t> scratchPcm16;
+    std::vector<double> scratchDoubleOut;
+    std::vector<int16_t> scratchPcm16Out;
     std::atomic<bool> isRunning;
     std::atomic<bool> isDeviceInitialized;
     double frameDuration;
     int sampleRate;
     int format;
+    int inputSource;
 
     AudioContext(int rate, int fmt)
-        : inputRingBuffer(nullptr),
+        : hasPlaybackDevice(false),
+          inputRingBuffer(nullptr),
           outputRingBuffer(nullptr),
           inputRingBufferPcm16(nullptr),
           outputRingBufferPcm16(nullptr),
@@ -138,16 +162,19 @@ struct AudioContext {
           isDeviceInitialized(false),
           frameDuration(0.003),
           sampleRate(rate),
-          format(fmt) {
+          format(fmt),
+          inputSource(INPUT_SOURCE_MICROPHONE) {
         size_t bufSize = ringBufferSizeForRate(rate);
         if (fmt == AUDIO_FORMAT_PCM16) {
             inputRingBufferPcm16 = new Int16RingBuffer(bufSize);
             outputRingBufferPcm16 = new Int16RingBuffer(bufSize);
             scratchPcm16.resize(SCRATCH_FRAMES);
+            scratchPcm16Out.resize(SCRATCH_FRAMES);
         } else {
             inputRingBuffer = new DoubleRingBuffer(bufSize);
             outputRingBuffer = new DoubleRingBuffer(bufSize);
             scratchDouble.resize(SCRATCH_FRAMES);
+            scratchDoubleOut.resize(SCRATCH_FRAMES);
         }
     }
 
@@ -166,8 +193,8 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
     AudioContext* context = (AudioContext*)pDevice->pUserData;
 
     if (context->format == AUDIO_FORMAT_PCM16) {
-        int16_t* scratch = context->scratchPcm16.data();
         if (pInput) {
+            int16_t* scratch = context->scratchPcm16.data();
             const float* floatInput = (const float*)pInput;
             for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
                 const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
@@ -179,6 +206,7 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
             }
         }
         if (pOutput) {
+            int16_t* scratch = context->scratchPcm16Out.data();
             float* floatOutput = (float*)pOutput;
             for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
                 const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
@@ -189,8 +217,8 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
             }
         }
     } else {
-        double* scratch = context->scratchDouble.data();
         if (pInput) {
+            double* scratch = context->scratchDouble.data();
             const float* floatInput = (const float*)pInput;
             for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
                 const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
@@ -201,6 +229,7 @@ void data_callback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uin
             }
         }
         if (pOutput) {
+            double* scratch = context->scratchDoubleOut.data();
             float* floatOutput = (float*)pOutput;
             for (ma_uint32 offset = 0; offset < frameCount; offset += SCRATCH_FRAMES) {
                 const ma_uint32 n = (ma_uint32)std::min((size_t)(frameCount - offset), SCRATCH_FRAMES);
@@ -242,6 +271,54 @@ int audio_io_init_device(void* handle) {
     ma_uint32 periodSizeInFrames = (ma_uint32)(context->frameDuration * context->sampleRate);
     if (periodSizeInFrames < 64) periodSizeInFrames = 64;
     if (periodSizeInFrames > 4096) periodSizeInFrames = 4096;
+
+    if (context->inputSource == INPUT_SOURCE_SYSTEM_AUDIO) {
+#if defined(_WIN32)
+        // System audio: capture the default render endpoint's mix via WASAPI
+        // loopback, excluding our own process ID so audio this app plays out
+        // (e.g. TTS through the output stream) is not fed back into the input.
+        // A loopback device is capture-only, so a separate playback device is
+        // opened below to keep the output stream functional.
+        ma_device_config captureConfig = ma_device_config_init(ma_device_type_loopback);
+        captureConfig.capture.pDeviceID = NULL;         // default render endpoint
+        captureConfig.capture.format = ma_format_f32;
+        captureConfig.capture.channels = CHANNELS;      // miniaudio downmixes to mono
+        captureConfig.capture.shareMode = ma_share_mode_shared;
+        captureConfig.sampleRate = context->sampleRate; // miniaudio resamples to engine rate
+        captureConfig.dataCallback = data_callback;
+        captureConfig.pUserData = context;
+        captureConfig.periodSizeInFrames = periodSizeInFrames;
+        captureConfig.wasapi.loopbackProcessID = (ma_uint32)GetCurrentProcessId();
+        captureConfig.wasapi.loopbackProcessExclude = MA_TRUE;
+
+        if (ma_device_init(NULL, &captureConfig, &context->device) != MA_SUCCESS) {
+            return -1;
+        }
+
+        ma_device_config playbackConfig = ma_device_config_init(ma_device_type_playback);
+        playbackConfig.playback.pDeviceID = NULL;
+        playbackConfig.playback.format = ma_format_f32;
+        playbackConfig.playback.channels = CHANNELS;
+        playbackConfig.playback.shareMode = ma_share_mode_shared;
+        playbackConfig.sampleRate = context->sampleRate;
+        playbackConfig.dataCallback = data_callback;
+        playbackConfig.pUserData = context;
+        playbackConfig.periodSizeInFrames = periodSizeInFrames;
+
+        if (ma_device_init(NULL, &playbackConfig, &context->playbackDevice) != MA_SUCCESS) {
+            ma_device_uninit(&context->device);
+            return -1;
+        }
+
+        context->hasPlaybackDevice = true;
+        context->isDeviceInitialized = true;
+        return 0;
+#else
+        // Loopback is a WASAPI-only feature; the Dart layer rejects system
+        // audio on non-Windows backends before reaching here. Guard anyway.
+        return -1;
+#endif
+    }
 
     ma_device_config config = ma_device_config_init(ma_device_type_duplex);
     config.capture.pDeviceID = NULL;
@@ -285,10 +362,16 @@ void audio_io_destroy(void* handle) {
     
     if (context->isRunning) {
         ma_device_stop(&context->device);
+        if (context->hasPlaybackDevice) {
+            ma_device_stop(&context->playbackDevice);
+        }
     }
-    
+
     if (context->isDeviceInitialized) {
         ma_device_uninit(&context->device);
+        if (context->hasPlaybackDevice) {
+            ma_device_uninit(&context->playbackDevice);
+        }
     }
     delete context;
 }
@@ -311,21 +394,34 @@ int audio_io_start(void* handle) {
         return -1;
     }
 
+    if (context->hasPlaybackDevice) {
+        if (ma_device_start(&context->playbackDevice) != MA_SUCCESS) {
+            ma_device_stop(&context->device);
+            return -1;
+        }
+    }
+
     context->isRunning = true;
     return 0;
 }
 
 int audio_io_stop(void* handle) {
     if (!handle) return -1;
-    
+
     AudioContext* context = (AudioContext*)handle;
-    
+
     if (!context->isRunning) return 0;
-    
+
     if (ma_device_stop(&context->device) != MA_SUCCESS) {
         return -1;
     }
-    
+
+    if (context->hasPlaybackDevice) {
+        if (ma_device_stop(&context->playbackDevice) != MA_SUCCESS) {
+            return -1;
+        }
+    }
+
     context->isRunning = false;
     return 0;
 }
@@ -409,6 +505,37 @@ int audio_io_set_frame_duration(void* handle, double duration) {
     context->frameDuration = duration;
     if (context->isDeviceInitialized) {
         ma_device_uninit(&context->device);
+        if (context->hasPlaybackDevice) {
+            ma_device_uninit(&context->playbackDevice);
+            context->hasPlaybackDevice = false;
+        }
+        context->isDeviceInitialized = false;
+    }
+    return 0;
+}
+
+// Selects the capture source (INPUT_SOURCE_MICROPHONE / _SYSTEM_AUDIO) applied
+// when the device is (re)initialised. Must be called before the device starts,
+// since the source fixes the device topology. Returns -1 on a bad handle or
+// while running, -2 when system audio is unsupported on this backend.
+int audio_io_set_input_source(void* handle, int source) {
+    if (!handle) return -1;
+    AudioContext* context = (AudioContext*)handle;
+    if (context->isRunning) return -1;
+    if (source != INPUT_SOURCE_SYSTEM_AUDIO) source = INPUT_SOURCE_MICROPHONE;
+#if !defined(_WIN32)
+    if (source == INPUT_SOURCE_SYSTEM_AUDIO) return -2;
+#endif
+    if (source == context->inputSource) return 0;
+    context->inputSource = source;
+    // Topology changed: drop any device built for the previous source so the
+    // next start rebuilds it.
+    if (context->isDeviceInitialized) {
+        ma_device_uninit(&context->device);
+        if (context->hasPlaybackDevice) {
+            ma_device_uninit(&context->playbackDevice);
+            context->hasPlaybackDevice = false;
+        }
         context->isDeviceInitialized = false;
     }
     return 0;
@@ -418,7 +545,11 @@ double audio_io_get_frame_duration(void* handle) {
     if (!handle) return 0.003;
     AudioContext* context = (AudioContext*)handle;
     if (context->isDeviceInitialized && context->isRunning) {
-        ma_uint32 actualBufferSize = context->device.playback.internalPeriodSizeInFrames;
+        // In loopback (system-audio) mode context->device is capture-only, so
+        // its playback period is 0; read the capture period instead.
+        ma_uint32 actualBufferSize = context->hasPlaybackDevice
+            ? context->device.capture.internalPeriodSizeInFrames
+            : context->device.playback.internalPeriodSizeInFrames;
         if (actualBufferSize > 0) {
             return (double)actualBufferSize / (double)context->device.sampleRate;
         }

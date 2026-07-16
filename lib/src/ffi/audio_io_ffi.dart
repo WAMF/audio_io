@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import '../audio_io_input_source.dart';
 import 'audio_io_bindings.dart';
 
 /// Common surface of the FFI transports so the platform layer can swap the
@@ -19,6 +20,10 @@ abstract class AudioIoFFITransport {
   Map<String, dynamic> getFormat();
   Future<void> requestFrameDuration(double duration);
   Future<double> getFrameDuration();
+
+  /// Selects the capture source applied at the next [start]. Fixed at
+  /// device-init time, so it must be set before [start].
+  void setInputSource(AudioIoInputSource source);
 }
 
 /// Core FFI engine shared by the main-isolate and audio-isolate transports.
@@ -43,6 +48,7 @@ class AudioIoFFICore {
   Timer? _inputTimer;
   bool _isRunning = false;
   double _requestedFrameDuration = 0.003;
+  int _inputSource = 0;
 
   Pointer<Double> _readBuffer = nullptr;
   int _readCapacity = 0;
@@ -62,6 +68,7 @@ class AudioIoFFICore {
     }
 
     _bindings.setFrameDuration(handle, _requestedFrameDuration);
+    _bindings.setInputSource(handle, _inputSource);
 
     if (_bindings.start(handle) != 0) {
       _bindings.destroy(handle);
@@ -150,6 +157,13 @@ class AudioIoFFICore {
     if (handle != null) {
       _bindings.setFrameDuration(handle, duration);
     }
+  }
+
+  /// Records the capture source (0 = microphone, 1 = system audio) to apply
+  /// when the native device is created at the next [start]. Not changeable
+  /// while running, since it fixes the device topology.
+  void setInputSource(int source) {
+    _inputSource = source;
   }
 
   /// The device's actual frame duration when running, otherwise the
@@ -243,6 +257,10 @@ class AudioIoFFI implements AudioIoFFITransport {
   Future<void> requestFrameDuration(double duration) async {
     _core.setFrameDuration(duration);
   }
+
+  @override
+  void setInputSource(AudioIoInputSource source) =>
+      _core.setInputSource(source.index);
 
   @override
   Future<double> getFrameDuration() async => _core.getFrameDuration();
