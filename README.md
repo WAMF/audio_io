@@ -182,6 +182,44 @@ main-isolate operation. The `input` / `output` streams still surface on the
 main isolate in every mode, so listener callbacks run there; move heavy DSP
 out of the listener if it competes with UI work.
 
+### System / tab audio input (web)
+
+Set `inputSource` to capture the machine's audio mix instead of the
+microphone. On the web this is backed by
+[`getDisplayMedia`](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia):
+`startWith` triggers the browser's share picker (it must run from a user
+gesture — a button tap is fine), and the audio track from the chosen tab or
+screen is piped into the same 48 kHz mono graph the microphone uses. The
+video track is required by the picker but is stopped immediately.
+
+```dart
+await audioIo.startWith(const AudioIoConfig(
+  inputSource: AudioIoInputSource.systemAudio,
+));
+```
+
+Platform reality — read before relying on it:
+
+- **Chromium only.** Chrome and Edge deliver an audio track; Firefox and
+  Safari implement `getDisplayMedia` but return **no** audio track. On those
+  browsers the input stream emits an `AudioIoException` with
+  `isSystemAudioUnsupported == true` — listen to the stream's `onError` (or
+  catch it) rather than assuming audio will arrive.
+- **Tab audio** works on every Chromium desktop platform when the user shares
+  a tab — the right UX for browser-hosted meetings ("share the Meet tab").
+- **Full system audio** (sharing the whole screen) works on Windows and
+  ChromeOS always, and on macOS only since Chrome 141 on macOS 14.2+.
+- The captured tab keeps playing out of the speakers by default, so a
+  listening app does not silence the source it is capturing.
+- When the user clicks **Stop sharing** in the browser UI, the capture track
+  ends and the `input` stream completes (`onDone`); output/playback keeps
+  running.
+
+On desktop `AudioIoInputSource.systemAudio` is backed by WASAPI loopback
+(Windows) and Core Audio process taps (macOS); it throws the same
+`isSystemAudioUnsupported` error on platforms/back ends that cannot provide
+it. See the `example/` app for a share-a-tab listening demo.
+
 ## Audio Format
 
 All platforms use a consistent audio format:

@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
+import 'src/audio_io_exception.dart';
+import 'src/audio_io_input_source.dart';
 import 'src/audio_io_threading.dart';
 import 'src/pcm16_adapters.dart';
 
@@ -10,24 +12,13 @@ import 'src/audio_io_stub.dart'
     if (dart.library.io) 'src/audio_io_native.dart'
     if (dart.library.js_interop) 'src/audio_io_web.dart' as impl;
 
+export 'src/audio_io_exception.dart';
+export 'src/audio_io_input_source.dart';
 export 'src/audio_io_threading.dart';
 
-class _ErrorCodes {
-  static const microphonePermissionDenied = 'MICROPHONE_PERMISSION_DENIED';
-}
-
-class AudioIoException implements Exception {
-  AudioIoException(this.code, this.message, [this.details]);
-
-  final String code;
-  final String message;
-  final dynamic details;
-
-  bool get isPermissionDenied => code == _ErrorCodes.microphonePermissionDenied;
-
-  @override
-  String toString() => 'AudioIoException($code): $message';
-}
+// AudioIoException and its error codes live in
+// `src/audio_io_exception.dart` (re-exported above) so platform
+// implementations can raise typed errors without a circular import.
 
 class _Constants {
   static const millisecPerSec = 1000;
@@ -78,6 +69,7 @@ class AudioIoConfig {
     this.format = AudioIoFormat.float64,
     this.latency = AudioIoLatency.Balanced,
     this.threading = AudioIoThreading.mainIsolate,
+    this.inputSource = AudioIoInputSource.microphone,
   });
 
   /// Rate the [AudioIo.inputBytes] / [AudioIo.outputBytes] streams use.
@@ -92,6 +84,14 @@ class AudioIoConfig {
   /// Where the audio transport runs; see [AudioIoThreading]. Optional:
   /// defaults to the main isolate, which every platform supports.
   final AudioIoThreading threading;
+
+  /// Which source the input stream captures from. Defaults to
+  /// [AudioIoInputSource.microphone]. [AudioIoInputSource.systemAudio]
+  /// captures the machine's audio mix (Windows via WASAPI loopback, macOS
+  /// via Core Audio taps) and throws an [AudioIoException] with
+  /// [AudioIoException.isSystemAudioUnsupported] on platforms/backends that
+  /// cannot provide it.
+  final AudioIoInputSource inputSource;
 }
 
 class AudioIo {
@@ -154,8 +154,16 @@ class AudioIo {
   /// Float64 and Int16, so [AudioIoFormat.float64] callers keep using
   /// [input] / [output] unchanged.
   Future<void> startWith(AudioIoConfig config) async {
+    if (!_impl.supportsInputSource(config.inputSource)) {
+      throw AudioIoException(
+        AudioIoErrorCodes.systemAudioUnsupported,
+        'Input source ${config.inputSource.name} is not supported on this '
+        'platform or audio backend.',
+      );
+    }
     _config = config;
     _impl.configureThreading(config.threading);
+    _impl.configureInputSource(config.inputSource);
     await requestLatency(config.latency);
     await start();
     if (config.format == AudioIoFormat.pcm16) {

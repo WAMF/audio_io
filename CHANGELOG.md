@@ -10,6 +10,15 @@
   the main-thread dispatch and per-sample Float64 conversion from the realtime
   sink render block — capture is now Float32 straight into a lock-free ring.
   Public API unchanged.
+- System / tab audio input: `AudioIoConfig.inputSource:
+  AudioIoInputSource.systemAudio` captures the machine's audio mix instead
+  of the microphone. On the web this uses `getDisplayMedia` — `startWith`
+  triggers the browser share picker (Chromium only; Firefox/Safari return no
+  audio track and the input stream emits an `AudioIoException` with
+  `isSystemAudioUnsupported`). Clicking "Stop sharing" completes the `input`
+  stream. The example app gains a Microphone / System-audio toggle. Desktop
+  legs (Windows WASAPI loopback #33, macOS Core Audio taps #32) share the
+  same API.
 
 ## 0.5.0
 
