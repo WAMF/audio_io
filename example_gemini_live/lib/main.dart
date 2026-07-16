@@ -222,6 +222,11 @@ class _GeminiLivePageState extends State<GeminiLivePage> {
     await AudioIo.instance.startWith(config);
 
     _audioSubscription = AudioIo.instance.inputBytes.listen((pcmChunk) {
+      // Half-duplex by design: mic chunks are dropped while the model is
+      // playing back so it does not hear itself. This means there is no voice
+      // barge-in — audio_io only offers echo cancellation on iOS, so an
+      // always-open mic would feed model audio back into the socket on the
+      // other platforms. See README "Limitations" for the full-duplex path.
       if (_micSuppressed) return;
       final encoded = base64Encode(pcmChunk);
       final message = jsonEncode({
