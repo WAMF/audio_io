@@ -60,6 +60,10 @@ Flutter/flutter_export_environment.sh
 ServiceDefinitions.json
 Runner/GeneratedPluginRegistrant.*
 
+# iOS specific - generated Flutter plugin scaffolding (regenerate locally, do not track)
+example/ios/Flutter/ephemeral/Packages/
+example/ios/Flutter/ephemeral/flutter_native_integration.env
+
 # macOS specific - Xcode build artifacts
 example/macos/Pods/
 example/macos/.symlinks/
