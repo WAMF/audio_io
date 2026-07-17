@@ -49,7 +49,7 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
-  void _setupAudioProcessing() {
+  void _setupAudioProcessing(AudioIoInputSource inputSource) {
     _audioSubscription?.cancel();
     _audioSubscription = AudioIo.instance.input.listen(
       (data) {
@@ -73,8 +73,11 @@ class _MyAppState extends State<MyApp> {
 
         // Echo the microphone back to the speaker. For system/tab audio we
         // only visualise the level: replaying captured system audio would
-        // feed straight back into the capture and loop.
-        if (_inputSource == AudioIoInputSource.microphone) {
+        // feed straight back into the capture and loop. Use the session's
+        // captured source, not the mutable field: changing the selector mid
+        // capture must not divert a live system-audio stream into the echo
+        // branch.
+        if (inputSource == AudioIoInputSource.microphone) {
           final out = List<double>.generate(
               data.length, (index) => data[index] * 0.9); // do things :)
           AudioIo.instance.output.add(out);
@@ -103,11 +106,16 @@ class _MyAppState extends State<MyApp> {
   }
 
   void startAudio() async {
+    // Snapshot the selected source for the whole session. _inputSource is
+    // mutable from the selector; capturing it once keeps permission checks,
+    // processing, config, and status consistent even if the user changes the
+    // selector while capture is running.
+    final inputSource = _inputSource;
     try {
       // Only check microphone permission when actually using the mic.
       if (!kIsWeb &&
           defaultTargetPlatform == TargetPlatform.android &&
-          _inputSource == AudioIoInputSource.microphone) {
+          inputSource == AudioIoInputSource.microphone) {
         final status = await Permission.microphone.request();
         if (!status.isGranted) {
           setState(() {
@@ -124,7 +132,7 @@ class _MyAppState extends State<MyApp> {
       // outside that window and be rejected. The input stream is stable before
       // start, so this early listener stays attached and receives capture data
       // and the typed picker error.
-      _setupAudioProcessing();
+      _setupAudioProcessing(inputSource);
 
       // startWith applies the latency and input source together. On web,
       // AudioIoInputSource.systemAudio triggers the browser's share picker
@@ -132,7 +140,7 @@ class _MyAppState extends State<MyApp> {
       await AudioIo.instance.startWith(
         AudioIoConfig(
           latency: _latencyValue,
-          inputSource: _inputSource,
+          inputSource: inputSource,
         ),
       );
 
@@ -140,7 +148,7 @@ class _MyAppState extends State<MyApp> {
       final lstring = latency.toStringAsPrecision(2);
       await AudioIo.instance.getFormat();
       setState(() {
-        _status = _inputSource == AudioIoInputSource.systemAudio
+        _status = inputSource == AudioIoInputSource.systemAudio
             ? 'Started — pick a tab to share ($lstring ms)'
             : 'Started ($lstring ms)';
       });
