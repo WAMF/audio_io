@@ -1,4 +1,13 @@
 #define MINIAUDIO_IMPLEMENTATION
+// On Windows, miniaudio.h transitively includes <windows.h> (WASAPI), which
+// defines function-like `min`/`max` macros. Those would macro-expand the
+// std::min(...) calls in data_callback and break the MSVC build. NOMINMAX must
+// be defined *before* the first include that pulls in <windows.h> — i.e. before
+// miniaudio.h here, not just before the explicit <windows.h> include below
+// (which is a no-op once the header guard is set).
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include "miniaudio.h"
 #include <algorithm>
 #include <cstring>
@@ -263,6 +272,11 @@ void* audio_io_create_with_config(double frameDuration, int sampleRate, int form
     return context;
 }
 
+// Initialises the native device(s) for the configured input source.
+// Returns 0 on success, -1 on a generic initialisation failure, and -2 when
+// the requested input source is unsupported on this OS/backend (e.g. WASAPI
+// process-excluded loopback on Windows older than build 20348). Callers
+// propagate -2 so the Dart layer can raise a typed SYSTEM_AUDIO_UNSUPPORTED.
 int audio_io_init_device(void* handle) {
     if (!handle) return -1;
 
@@ -288,11 +302,18 @@ int audio_io_init_device(void* handle) {
         captureConfig.dataCallback = data_callback;
         captureConfig.pUserData = context;
         captureConfig.periodSizeInFrames = periodSizeInFrames;
+        // Process-excluded loopback (VAD\\Process_Loopback) is only available
+        // from Windows build 20348 (Windows 11 / Server 2022). On Windows 10
+        // (e.g. 19045) ma_device_init fails here. Rather than silently falling
+        // back to ordinary endpoint loopback — which would re-capture this
+        // app's own output and defeat the point of the exclusion — report the
+        // source as unsupported (-2) so the Dart layer raises a typed
+        // SYSTEM_AUDIO_UNSUPPORTED error. The README documents the minimum.
         captureConfig.wasapi.loopbackProcessID = (ma_uint32)GetCurrentProcessId();
         captureConfig.wasapi.loopbackProcessExclude = MA_TRUE;
 
         if (ma_device_init(NULL, &captureConfig, &context->device) != MA_SUCCESS) {
-            return -1;
+            return -2;
         }
 
         ma_device_config playbackConfig = ma_device_config_init(ma_device_type_playback);
@@ -315,8 +336,9 @@ int audio_io_init_device(void* handle) {
         return 0;
 #else
         // Loopback is a WASAPI-only feature; the Dart layer rejects system
-        // audio on non-Windows backends before reaching here. Guard anyway.
-        return -1;
+        // audio on non-Windows backends before reaching here. Guard anyway,
+        // reporting the source as unsupported (-2) rather than a generic fault.
+        return -2;
 #endif
     }
 
@@ -383,10 +405,13 @@ int audio_io_start(void* handle) {
     
     if (context->isRunning) return 0;
     
-    // Initialize device if not already done
+    // Initialize device if not already done. Propagate the init return code
+    // verbatim so an unsupported input source (-2) stays distinct from a
+    // generic failure (-1) on the way up to Dart.
     if (!context->isDeviceInitialized) {
-        if (audio_io_init_device(handle) != 0) {
-            return -1;
+        int rc = audio_io_init_device(handle);
+        if (rc != 0) {
+            return rc;
         }
     }
     

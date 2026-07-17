@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import '../audio_io_errors.dart';
 import '../audio_io_input_source.dart';
 import 'audio_io_ffi.dart';
 
@@ -36,8 +37,13 @@ void _audioIsolateMain((SendPort ready, SendPort events) ports) {
   commands.listen((dynamic message) {
     try {
       _handleCommand(core, events, message as List<dynamic>);
+    } on InputSourceUnsupportedException catch (e) {
+      // Preserve the typed-ness across the isolate boundary: the trailing flag
+      // tells the proxy to rebuild an InputSourceUnsupportedException rather
+      // than a generic Exception, so callers still see the typed error.
+      events.send([_Protocol.error, e.message, true]);
     } on Object catch (e) {
-      events.send([_Protocol.error, e.toString()]);
+      events.send([_Protocol.error, e.toString(), false]);
     }
   });
 }
@@ -192,7 +198,11 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
         _startCompleter?.complete();
         _startCompleter = null;
       case _Protocol.error:
-        _reportError(Exception(message[1] as String));
+        final unsupportedInputSource =
+            message.length > 2 && message[2] == true;
+        _reportError(unsupportedInputSource
+            ? InputSourceUnsupportedException(message[1] as String)
+            : Exception(message[1] as String));
       case _Protocol.stopped:
         _stopCompleter?.complete();
         _stopCompleter = null;

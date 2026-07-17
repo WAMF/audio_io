@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'src/audio_io_errors.dart';
 import 'src/audio_io_exception.dart';
 import 'src/audio_io_input_source.dart';
 import 'src/audio_io_threading.dart';
@@ -163,6 +164,15 @@ class AudioIo {
     }
     try {
       await _impl.start();
+    } on InputSourceUnsupportedException catch (e) {
+      // A capability limitation the native engine only discovers at device
+      // init (e.g. WASAPI process-loopback needs Windows build 20348+) surfaces
+      // as an InputSourceUnsupportedException; present it as the same typed
+      // AudioIoException the up-front supportsInputSource check throws.
+      throw AudioIoException(
+        AudioIoErrorCodes.systemAudioUnsupported,
+        e.message,
+      );
     } on PlatformException catch (e) {
       throw AudioIoException(e.code, e.message ?? 'Unknown error', e.details);
     }

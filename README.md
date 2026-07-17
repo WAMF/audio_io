@@ -238,7 +238,7 @@ await audioIo.startWith(const AudioIoConfig(
 
 | Platform | System audio | Mechanism |
 |----------|--------------|-----------|
-| Windows  | ✅ Supported | WASAPI loopback (`ma_device_type_loopback`) |
+| Windows  | ✅ Supported (build 20348+) | WASAPI loopback (`ma_device_type_loopback`) |
 | macOS    | ✅ Supported | Core Audio process taps (macOS 14.2+) |
 | Linux    | ⛔ Not yet | PulseAudio/PipeWire monitor sources — planned |
 | Android / iOS / Web | ⛔ Not supported | — |
@@ -249,6 +249,15 @@ app that plays TTS through the output stream while capturing system audio does
 **not** hear itself. The output stream keeps working in this mode: because a
 WASAPI loopback device is capture-only, a separate playback device is opened
 alongside it.
+
+**Windows minimum: build 20348 (Windows 11 / Windows Server 2022).**
+Process-excluded loopback uses the WASAPI `VAD\Process_Loopback` activation
+path, which only exists from build 20348. On older Windows (e.g. Windows 10
+19045) the native device fails to initialise; rather than silently dropping the
+own-process exclusion and re-capturing the app's own output, `startWith` throws
+the same `AudioIoException` with `isSystemAudioUnsupported == true` as the
+unsupported platforms below, so the microphone-fallback pattern covers this case
+too.
 
 **No permission prompt** is required for loopback capture on Windows.
 

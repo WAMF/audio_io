@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import '../audio_io_errors.dart';
 import '../audio_io_input_source.dart';
 import 'audio_io_bindings.dart';
 
@@ -38,6 +39,10 @@ class AudioIoFFICore {
 
   static const pollInterval = Duration(milliseconds: 5);
   static const _maxChunkFrames = 4800;
+
+  /// Native `audio_io_start` return code for an input source that the current
+  /// OS/backend cannot provide (see `audio_io_init_device` in the C layer).
+  static const _startUnsupportedInputSource = -2;
   static const defaultFormat = <String, dynamic>{
     'input': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
     'output': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
@@ -70,8 +75,16 @@ class AudioIoFFICore {
     _bindings.setFrameDuration(handle, _requestedFrameDuration);
     _bindings.setInputSource(handle, _inputSource);
 
-    if (_bindings.start(handle) != 0) {
+    final startResult = _bindings.start(handle);
+    if (startResult != 0) {
       _bindings.destroy(handle);
+      if (startResult == _startUnsupportedInputSource) {
+        throw const InputSourceUnsupportedException(
+          'System audio capture is unavailable on this system. WASAPI '
+          'process-excluded loopback requires Windows 11 or Windows Server '
+          '2022 (build 20348) or newer.',
+        );
+      }
       throw Exception('Failed to start audio device');
     }
 
