@@ -46,11 +46,12 @@ tap connect, allow microphone access, and start talking.
 This example is deliberately **half-duplex**: while the model is speaking the
 mic is fully muted, so you cannot interrupt Gemini by voice ("barge-in"). The
 mute exists to stop the model hearing its own playback and talking over itself.
-`audio_io` only provides acoustic echo cancellation on iOS (voice-processing
-I/O); on macOS, Android, Web, Windows, and Linux there is no cross-platform AEC,
-so an always-open mic would feed the model's audio straight back into the
-WebSocket. Full-duplex barge-in was therefore left out of the example rather
-than shipped as behaviour that only works correctly on one platform.
+`audio_io` provides no built-in acoustic echo cancellation on any platform
+(the shipped iOS backend uses a plain `.playAndRecord` session with no
+voice-processing I/O), so on every platform an always-open mic would feed the
+model's audio straight back into the WebSocket. Full-duplex barge-in was
+therefore left out of the example rather than shipped as behaviour that would
+echo on every platform.
 
 A fuller integration that wanted barge-in would keep streaming mic audio during
 playback and rely on Gemini's own VAD `interrupted` signal to stop playback (the
