@@ -117,16 +117,24 @@ class _MyAppState extends State<MyApp> {
         }
       }
 
+      // Subscribe to the input stream BEFORE startWith. On web the share
+      // picker (getDisplayMedia) is triggered during start() and must run
+      // while the initiating tap still carries transient user activation; if
+      // we subscribed only after awaiting startWith, the picker would fire
+      // outside that window and be rejected. The input stream is stable before
+      // start, so this early listener stays attached and receives capture data
+      // and the typed picker error.
+      _setupAudioProcessing();
+
       // startWith applies the latency and input source together. On web,
       // AudioIoInputSource.systemAudio triggers the browser's share picker
-      // when the input stream is first listened to (see _setupAudioProcessing).
+      // during start because a listener is already attached (above).
       await AudioIo.instance.startWith(
         AudioIoConfig(
           latency: _latencyValue,
           inputSource: _inputSource,
         ),
       );
-      _setupAudioProcessing(); // Set up audio processing after starting
 
       final latency = await AudioIo.instance.currentLatency();
       final lstring = latency.toStringAsPrecision(2);

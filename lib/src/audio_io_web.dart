@@ -371,7 +371,19 @@ class AudioIoWeb extends AudioIoImpl {
   }
 
   @override
-  Stream<List<double>>? get inputAudioStream => _inputController?.stream;
+  Stream<List<double>>? get inputAudioStream => _ensureInputController().stream;
+
+  /// The input stream must exist *before* [start], so a listener that
+  /// subscribes before `startWith` attaches to the real controller rather than
+  /// a throwaway `Stream.empty()` and still receives the getDisplayMedia picker
+  /// error (delivered via [_connectInputIfNeeded]'s `addError`). Created lazily
+  /// and reused across a start; broadcast so a listen-before-start and a
+  /// listen-after-start both work and multiple listeners are allowed.
+  StreamController<List<double>> _ensureInputController() {
+    return _inputController ??= StreamController<List<double>>.broadcast(
+      onListen: _connectInputIfNeeded,
+    );
+  }
 
   @override
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
@@ -436,11 +448,11 @@ class AudioIoWeb extends AudioIoImpl {
       final sampleRate = _audioContext!.sampleRate;
       _bufferSize = _calculateBufferSize(sampleRate);
 
-      // Request the microphone lazily so output-only users never see a
-      // permission prompt.
-      _inputController = StreamController<List<double>>.broadcast(
-        onListen: _connectInputIfNeeded,
-      );
+      // Reuse the controller a pre-start listener may already hold so its
+      // subscription stays attached across start (and receives input/errors);
+      // create it here if nothing has listened yet. The microphone is still
+      // requested lazily via onListen, so output-only users see no prompt.
+      _ensureInputController();
       _outputController = StreamController<List<double>>();
 
       final workletStarted = await _tryStartWorkletOutput();
