@@ -19,6 +19,7 @@ enum Methods: String {
     case stop
     case clearOutput
     case requestFrameDuration
+    case requestOutputBufferDuration
     case getFrameDuration
     case requestFormat
     case getFormat
@@ -63,6 +64,7 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
     let engine = AVAudioEngine()
     var inputConverter = AVAudioMixerNode()
     var _frameDuration = _Constants.defaultFrameDuration
+    var _outputBufferDuration: Double?
     var _sampleRate = _Constants.preferedSampleRate
     var buffer = AudioOutputRing(minimumCapacity: 2048)
     var inputRing = AudioInputRing(minimumCapacity: 2048)
@@ -161,6 +163,12 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
                 }
             }
             result(nil)
+        case Methods.requestOutputBufferDuration.rawValue:
+            _outputBufferDuration = call.arguments as? Double
+            if _isRunning {
+                resetAudio()
+            }
+            result(nil)
         case Methods.getFrameDuration.rawValue:
             result(_frameDuration)
         case Methods.getFormat.rawValue:
@@ -210,12 +218,21 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         }
     }
 
+    private func outputRingCapacity() -> Int {
+        if let seconds = _outputBufferDuration, seconds > 0 {
+            return max(
+                _Constants.ringBufferSize,
+                Int(seconds * _Constants.outputContractSampleRate))
+        }
+        return max(
+            _Constants.ringBufferSize,
+            Int(_frameDuration * _Constants.outputContractSampleRate
+                * maxFrameJitter))
+    }
+
     private func startInternal() throws {
         let newOutputRing = AudioOutputRing(
-                minimumCapacity: max(
-                    _Constants.ringBufferSize,
-                    Int(_frameDuration * _Constants.outputContractSampleRate
-                        * maxFrameJitter)))
+                minimumCapacity: outputRingCapacity())
 
         try AVAudioSession.sharedInstance().setCategory(
             .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])

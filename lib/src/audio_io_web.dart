@@ -346,6 +346,7 @@ class AudioIoWeb extends AudioIoImpl {
   bool _isRunning = false;
   bool _inputRequested = false;
   double _requestedFrameDuration = 0.003; // Default 3ms (Balanced)
+  double? _requestedOutputBufferSeconds;
   int _bufferSize = _minBufferSize;
   AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
   MediaStreamAudioSourceNode? _inputSourceNode;
@@ -412,6 +413,11 @@ class AudioIoWeb extends AudioIoImpl {
   }
 
   int _calculateRingFrames() {
+    final seconds = _requestedOutputBufferSeconds;
+    if (seconds != null && seconds > 0) {
+      final frames = (seconds * _contractSampleRate).round();
+      return frames > _minRingFrames ? frames : _minRingFrames;
+    }
     final requested = (_requestedFrameDuration *
             _contractSampleRate *
             _ringDurationMultiplier)
@@ -782,6 +788,18 @@ class AudioIoWeb extends AudioIoImpl {
     _requestedFrameDuration = duration;
 
     // If already running, restart with new buffer size
+    if (_isRunning) {
+      await stop();
+      await start();
+    }
+  }
+
+  @override
+  Future<void> requestOutputBufferDuration(double seconds) async {
+    _requestedOutputBufferSeconds = seconds;
+
+    // If already running, restart so the output ring is rebuilt at the new
+    // size (the ScriptProcessor / worklet ring is created at start).
     if (_isRunning) {
       await stop();
       await start();

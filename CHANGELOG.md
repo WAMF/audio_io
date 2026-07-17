@@ -19,6 +19,17 @@
   stream. The example app gains a Microphone / System-audio toggle. Desktop
   legs (Windows WASAPI loopback #33, macOS Core Audio taps #32) share the
   same API.
+- Configurable playback buffer: `AudioIoConfig.outputBufferDuration` (and
+  `AudioIo.requestOutputBufferDuration`) size the output ring in seconds of
+  the 48 kHz playback contract, independent of the frame duration / latency.
+  Latency-sensitive callers can cap queued output low so a barge-in
+  (`clearOutput`) drops less stale audio, while burst producers (e.g. Gemini
+  Live) can size it high enough that a multi-second response is not dropped.
+  Implemented on all back ends (iOS, macOS, web, and the FFI back ends —
+  Android, Windows, Linux, including the dedicated audio isolate). Each back
+  end enforces a small safety floor, so smaller values are clamped up. When
+  unset (the default) every back end keeps its existing sizing — no
+  behaviour change. Resolves #12.
 
 ## 0.5.0
 

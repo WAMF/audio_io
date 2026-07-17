@@ -159,6 +159,24 @@ api.audioResponses.listen(audioIo.outputBytes.add);
 await audioIo.clearOutput();
 ```
 
+#### Playback buffer size
+
+The output ring is sized from the frame duration by default. Set
+`outputBufferDuration` to size it independently — cap it low so a barge-in
+drops less stale audio, or raise it so a burst producer (e.g. Gemini Live
+returning several seconds at once) is not dropped. It is expressed in
+seconds of the 48 kHz playback contract; each back end enforces a small
+safety floor, so smaller values are clamped up:
+
+```dart
+await audioIo.startWith(const AudioIoConfig(
+  outputBufferDuration: 5, // hold up to ~5 s of queued playback
+));
+
+// Or on a running session, before pushing a burst:
+await audioIo.requestOutputBufferDuration(0.3); // cap ~300 ms for low latency
+```
+
 See `example_gemini_live` for a complete voice conversation app, or try it
 in the browser at [wamf.github.io/audio_io](https://wamf.github.io/audio_io/).
 

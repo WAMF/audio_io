@@ -20,6 +20,7 @@ abstract class AudioIoFFITransport {
   void clearOutput();
   Map<String, dynamic> getFormat();
   Future<void> requestFrameDuration(double duration);
+  Future<void> requestOutputBufferDuration(double seconds);
   Future<double> getFrameDuration();
 
   /// Selects the capture source applied at the next [start]. Fixed at
@@ -54,6 +55,7 @@ class AudioIoFFICore {
   bool _isRunning = false;
   double _requestedFrameDuration = 0.003;
   int _inputSource = 0;
+  double? _requestedOutputBufferSeconds;
 
   Pointer<Double> _readBuffer = nullptr;
   int _readCapacity = 0;
@@ -74,6 +76,11 @@ class AudioIoFFICore {
 
     _bindings.setFrameDuration(handle, _requestedFrameDuration);
     _bindings.setInputSource(handle, _inputSource);
+
+    final outputBufferSeconds = _requestedOutputBufferSeconds;
+    if (outputBufferSeconds != null) {
+      _bindings.setOutputBufferSeconds(handle, outputBufferSeconds);
+    }
 
     final startResult = _bindings.start(handle);
     if (startResult != 0) {
@@ -179,6 +186,17 @@ class AudioIoFFICore {
     _inputSource = source;
   }
 
+  /// Sizes the output ring to hold roughly [seconds] of audio. The native
+  /// side rejects the change while running and reallocates the ring at the
+  /// device rate, so the value is (re)applied in [start].
+  void setOutputBufferSeconds(double seconds) {
+    _requestedOutputBufferSeconds = seconds;
+    final handle = _handle;
+    if (handle != null && !_isRunning) {
+      _bindings.setOutputBufferSeconds(handle, seconds);
+    }
+  }
+
   /// The device's actual frame duration when running, otherwise the
   /// requested one — matching the isolate transport, which reports the
   /// requested duration until its worker delivers the device value.
@@ -274,6 +292,11 @@ class AudioIoFFI implements AudioIoFFITransport {
   @override
   void setInputSource(AudioIoInputSource source) =>
       _core.setInputSource(source.index);
+
+  @override
+  Future<void> requestOutputBufferDuration(double seconds) async {
+    _core.setOutputBufferSeconds(seconds);
+  }
 
   @override
   Future<double> getFrameDuration() async => _core.getFrameDuration();

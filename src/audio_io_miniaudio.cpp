@@ -124,9 +124,11 @@ public:
 using DoubleRingBuffer = RingBuffer<double>;
 using Int16RingBuffer = RingBuffer<int16_t>;
 
+static const size_t MIN_OUTPUT_RING_FRAMES = 8192;
+
 static size_t ringBufferSizeForRate(int sampleRate) {
     size_t size = (size_t)(sampleRate * 0.2);
-    if (size < 8192) size = 8192;
+    if (size < MIN_OUTPUT_RING_FRAMES) size = MIN_OUTPUT_RING_FRAMES;
     return size;
 }
 
@@ -562,6 +564,29 @@ int audio_io_set_input_source(void* handle, int source) {
             context->hasPlaybackDevice = false;
         }
         context->isDeviceInitialized = false;
+    }
+    return 0;
+}
+
+// Resizes the output (playback) ring to hold roughly `seconds` of audio at
+// the context's sample rate, so latency-sensitive callers can cap queued
+// output low and burst producers can size it high. Rejected while running;
+// the transport applies it before start. Input sizing is unchanged.
+int audio_io_set_output_buffer_seconds(void* handle, double seconds) {
+    if (!handle) return -1;
+    AudioContext* context = (AudioContext*)handle;
+    if (context->isRunning) return -1;
+    if (seconds <= 0.0) return -1;
+
+    size_t frames = (size_t)(seconds * context->sampleRate);
+    if (frames < MIN_OUTPUT_RING_FRAMES) frames = MIN_OUTPUT_RING_FRAMES;
+
+    if (context->format == AUDIO_FORMAT_PCM16) {
+        delete context->outputRingBufferPcm16;
+        context->outputRingBufferPcm16 = new Int16RingBuffer(frames);
+    } else {
+        delete context->outputRingBuffer;
+        context->outputRingBuffer = new DoubleRingBuffer(frames);
     }
     return 0;
 }
