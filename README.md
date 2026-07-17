@@ -239,7 +239,7 @@ await audioIo.startWith(const AudioIoConfig(
 | Platform | System audio | Mechanism |
 |----------|--------------|-----------|
 | Windows  | ✅ Supported (build 20348+) | WASAPI loopback (`ma_device_type_loopback`) |
-| macOS    | ✅ Supported | Core Audio process taps (macOS 14.2+) |
+| macOS    | ⛔ Not yet | Core Audio process taps (macOS 14.2+) — planned (#32) |
 | Linux    | ⛔ Not yet | PulseAudio/PipeWire monitor sources — planned |
 | Android / iOS / Web | ⛔ Not supported | — |
 

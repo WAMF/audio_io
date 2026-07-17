@@ -10,8 +10,8 @@ enum AudioIoInputSource {
 
   /// The system audio mix — what is currently playing out of the machine
   /// (meetings, media, other apps). Implemented on Windows via WASAPI
-  /// loopback and on macOS via Core Audio process taps (see issues #33 /
-  /// #32). The host process is excluded from the capture where the platform
+  /// loopback (#33); planned on macOS via Core Audio process taps (#32).
+  /// The host process is excluded from the capture where the platform
   /// supports it, so an app playing TTS through the output stream does not
   /// hear itself.
   systemAudio,
