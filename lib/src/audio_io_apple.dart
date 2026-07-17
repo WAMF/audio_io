@@ -51,25 +51,45 @@ class AudioIoApple extends AudioIoImpl {
     // PlatformException, which `AudioIo.start` maps to `AudioIoException`.
     await _methods.invokeMethod<void>('start');
 
-    // Cache the true engine rates so the synchronous `getFormat()` (used when
-    // wiring the PCM16 adapters right after start) reports them as before.
-    final format = await _methods.invokeMethod<dynamic>('getFormat');
-    if (format is Map) {
-      _format = format.map((key, dynamic v) => MapEntry(key.toString(), v));
-    }
+    // The native engine and microphone capture are now live. If any of the
+    // remaining setup throws — `getFormat` failing, or (the PR's top risk) the
+    // FFI transport's `lookupFunction` throwing because a release linker
+    // stripped an `@_cdecl` symbol — the error must not escape with the engine
+    // still running. Tear down whatever partial transport exists and stop the
+    // native engine before rethrowing, so a failed start leaves nothing live.
+    try {
+      // Cache the true engine rates so the synchronous `getFormat()` (used when
+      // wiring the PCM16 adapters right after start) reports them as before.
+      final format = await _methods.invokeMethod<dynamic>('getFormat');
+      if (format is Map) {
+        _format = format.map((key, dynamic v) => MapEntry(key.toString(), v));
+      }
 
-    // Data plane: start the FFI poll/write transport on the configured
-    // isolate. Only started once the engine — and therefore the rings — is
-    // live, so the first poll never races ring allocation.
-    final wantIsolate = _threading == AudioIoThreading.audioIsolate;
-    if (_transport != null &&
-        (_transport is AudioIoAppleIsolateProxy) != wantIsolate) {
-      await _transport!.stop();
+      // Data plane: start the FFI poll/write transport on the configured
+      // isolate. Only started once the engine — and therefore the rings — is
+      // live, so the first poll never races ring allocation.
+      final wantIsolate = _threading == AudioIoThreading.audioIsolate;
+      if (_transport != null &&
+          (_transport is AudioIoAppleIsolateProxy) != wantIsolate) {
+        await _transport!.stop();
+        _transport = null;
+      }
+      _transport ??= wantIsolate
+          ? AudioIoAppleIsolateProxy()
+          : AudioIoAppleMainTransport();
+      await _transport!.start();
+    } catch (_) {
+      // Best-effort rollback; swallow teardown errors so the original failure
+      // is the one that propagates.
+      try {
+        await _transport?.stop();
+      } catch (_) {}
       _transport = null;
+      try {
+        await _methods.invokeMethod<void>('stop');
+      } catch (_) {}
+      rethrow;
     }
-    _transport ??=
-        wantIsolate ? AudioIoAppleIsolateProxy() : AudioIoAppleMainTransport();
-    await _transport!.start();
   }
 
   @override
