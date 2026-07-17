@@ -123,6 +123,11 @@ class AudioIoApple extends AudioIoImpl {
   }
 
   @override
+  Future<void> requestOutputBufferDuration(double seconds) async {
+    await _methods.invokeMethod<void>('requestOutputBufferDuration', seconds);
+  }
+
+  @override
   Future<double> getFrameDuration() async {
     final value = await _methods.invokeMethod<dynamic>('getFrameDuration');
     if (value is num) return value.toDouble();
