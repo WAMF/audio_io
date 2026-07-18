@@ -80,7 +80,15 @@ class AudioIoConfig {
     this.inputSource = AudioIoInputSource.microphone,
     this.outputBufferDuration,
   })  : inputSampleRate = inputSampleRate ?? sampleRate,
-        outputSampleRate = outputSampleRate ?? sampleRate;
+        outputSampleRate = outputSampleRate ?? sampleRate,
+        // Debug-only descriptive guard. Complemented by the release-time
+        // throw in [checkInvariants] (asserts are stripped in
+        // release/profile builds); see that method for why the throw is
+        // needed. A non-positive value cannot size an output ring.
+        assert(
+          outputBufferDuration == null || outputBufferDuration > 0,
+          'outputBufferDuration must be greater than 0 seconds',
+        );
 
   /// Shorthand rate applied to both directions. Sets [inputSampleRate] and
   /// [outputSampleRate] unless either is given explicitly.
@@ -130,6 +138,36 @@ class AudioIoConfig {
   /// (derived from the frame duration on Apple/web, a fixed default on the
   /// FFI back ends) — no behaviour change.
   final double? outputBufferDuration;
+
+  /// Enforces every numeric field invariant in ALL build modes, throwing
+  /// [ArgumentError] on a contract breach.
+  ///
+  /// The const-constructor `assert`s that carry the descriptive messages are
+  /// stripped in release/profile builds, so an out-of-range value would
+  /// otherwise reach the native audio engine — where it can size buffers from
+  /// a garbage frame count and cause native crashes or undefined behaviour
+  /// with no signal to the caller. [AudioIo.startWith] calls this before the
+  /// config reaches the engine, mirroring the sample-rate-mismatch guard that
+  /// throws in all build modes (PR #7).
+  void checkInvariants() {
+    checkOutputBufferDuration(outputBufferDuration);
+  }
+
+  /// Throws [ArgumentError] unless [seconds] is null or a positive, finite
+  /// number of seconds. Enforced in all build modes (see [checkInvariants]).
+  ///
+  /// A non-positive duration cannot size a playback ring, and a non-finite
+  /// one (NaN/infinity) slips past the native `seconds <= 0` guard and reaches
+  /// `(size_t)(seconds * sampleRate)`, which is undefined behaviour.
+  static void checkOutputBufferDuration(double? seconds) {
+    if (seconds != null && (!seconds.isFinite || seconds <= 0)) {
+      throw ArgumentError.value(
+        seconds,
+        'outputBufferDuration',
+        'must be a positive, finite number of seconds',
+      );
+    }
+  }
 }
 
 class AudioIo {
@@ -221,6 +259,10 @@ class AudioIo {
   /// between Float64 and Int16, so [AudioIoFormat.float64] callers keep using
   /// [input] / [output] unchanged.
   Future<void> startWith(AudioIoConfig config) async {
+    // Enforce the config's numeric invariants in every build mode: the
+    // const-constructor asserts are stripped in release/profile, so without
+    // this an out-of-range value would reach the native engine unchecked.
+    config.checkInvariants();
     if (!_impl.supportsInputSource(config.inputSource)) {
       throw AudioIoException(
         AudioIoErrorCodes.systemAudioUnsupported,
