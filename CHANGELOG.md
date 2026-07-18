@@ -1,5 +1,16 @@
 ## Unreleased
 
+- Web: the AudioContext sample-rate mismatch is now handled by transparent
+  Dart-side resampling — `startWith` accepts any supported `AudioIoSampleRate`
+  on the web without throwing (the earlier `allowSampleRateMismatch` guard is
+  gone). Input PCM16 (`inputBytes`) is emitted at the requested rate and output
+  PCM16 (`outputBytes`) at the requested rate is up/downsampled to the browser
+  rate on the way to the speakers: the AudioWorklet converts between the
+  browser rate and the 48 kHz engine contract on the rendering thread and the
+  Dart `Pcm16Adapters` / `PushResampler` convert between the contract and the
+  requested rate. This landed with the asymmetric-rate work (#41); this change
+  adds regression tests that pin the web input/output resampling paths
+  (up/down/equal rate) so the acceptance criteria stay covered. Resolves #8.
 - PCM16: asymmetric input/output sample rates. `AudioIoConfig` gains optional
   `inputSampleRate` / `outputSampleRate`; each direction resamples to and from
   the fixed 48 kHz engine contract independently, so callers can run e.g. a
