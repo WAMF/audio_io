@@ -48,6 +48,10 @@ typedef AudioIoSetInputSourceNative = Int32 Function(
     Pointer<Void> handle, Int32 source);
 typedef AudioIoSetInputSource = int Function(
     Pointer<Void> handle, int source);
+typedef AudioIoSetOutputBufferSecondsNative = Int32 Function(
+    Pointer<Void> handle, Double seconds);
+typedef AudioIoSetOutputBufferSeconds = int Function(
+    Pointer<Void> handle, double seconds);
 
 class AudioIoBindings {
   late final DynamicLibrary _lib;
@@ -65,6 +69,7 @@ class AudioIoBindings {
   late final AudioIoSetFrameDuration setFrameDuration;
   late final AudioIoGetFrameDuration getFrameDuration;
   late final AudioIoSetInputSource setInputSource;
+  late final AudioIoSetOutputBufferSeconds setOutputBufferSeconds;
 
   AudioIoBindings() {
     _lib = _loadLibrary();
@@ -126,6 +131,11 @@ class AudioIoBindings {
     setInputSource = _lib
         .lookup<NativeFunction<AudioIoSetInputSourceNative>>(
             'audio_io_set_input_source')
+        .asFunction();
+
+    setOutputBufferSeconds = _lib
+        .lookup<NativeFunction<AudioIoSetOutputBufferSecondsNative>>(
+            'audio_io_set_output_buffer_seconds')
         .asFunction();
   }
 

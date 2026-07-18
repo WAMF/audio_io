@@ -55,6 +55,10 @@ void _handleCommand(
     case _Protocol.start:
       core.setFrameDuration(message[1] as double);
       core.setInputSource(message[2] as int);
+      final outputBufferSeconds = message[3] as double?;
+      if (outputBufferSeconds != null) {
+        core.setOutputBufferSeconds(outputBufferSeconds);
+      }
       core.start((frames) => events.send([_Protocol.input, frames]));
       events.send([_Protocol.state, core.getFormat(), core.getFrameDuration()]);
     case _Protocol.write:
@@ -95,6 +99,7 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
   double _frameDuration = 0.003;
   double _requestedFrameDuration = 0.003;
   int _requestedInputSource = 0;
+  double? _requestedOutputBufferSeconds;
   bool _isRunning = false;
 
   @override
@@ -135,8 +140,12 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
 
     final startCompleter = Completer<void>();
     _startCompleter = startCompleter;
-    _commands!
-        .send([_Protocol.start, _requestedFrameDuration, _requestedInputSource]);
+    _commands!.send([
+      _Protocol.start,
+      _requestedFrameDuration,
+      _requestedInputSource,
+      _requestedOutputBufferSeconds,
+    ]);
     try {
       await startCompleter.future;
       _isRunning = true;
@@ -171,6 +180,14 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
     if (_isRunning) {
       _commands?.send([_Protocol.setFrameDuration, duration]);
     }
+  }
+
+  /// Stored and applied on the next [start]: the native ring is sized before
+  /// the device starts and cannot be resized while running, so there is no
+  /// live command to forward.
+  @override
+  Future<void> requestOutputBufferDuration(double seconds) async {
+    _requestedOutputBufferSeconds = seconds;
   }
 
   @override

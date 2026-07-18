@@ -17,6 +17,10 @@ abstract class AudioIoImpl {
   Future<void> clearOutput();
   Map<String, dynamic> getFormat();
   Future<void> requestFrameDuration(double duration);
+
+  /// Sizes the output playback ring to hold roughly [seconds] of audio,
+  /// independent of the frame duration. Applied on the next [start].
+  Future<void> requestOutputBufferDuration(double seconds);
   Future<double> getFrameDuration();
 
   /// Selects where the audio transport runs for the next [start].

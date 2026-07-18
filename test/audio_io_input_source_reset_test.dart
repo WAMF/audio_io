@@ -48,6 +48,8 @@ class _RecordingImpl extends AudioIoImpl {
   @override
   Future<void> requestFrameDuration(double duration) async {}
   @override
+  Future<void> requestOutputBufferDuration(double seconds) async {}
+  @override
   Future<double> getFrameDuration() async => 0;
   @override
   Sink<Uint8List>? pcm16OutputSink(int sourceRate) => null;

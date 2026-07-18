@@ -8,6 +8,7 @@ import 'package:web/web.dart' as web;
 import 'audio_io_exception.dart';
 import 'audio_io_input_source.dart';
 import 'audio_io_stub.dart';
+import 'output_buffer_math.dart';
 import 'output_ring.dart';
 
 /// `MediaDevices.getDisplayMedia` is not declared in `package:web` 0.5.x, so
@@ -128,9 +129,16 @@ extension AudioBufferExt on AudioBuffer {
 /// and posts transferable fixed-size chunks back to the main thread.
 const String _workletSource = '''
 class AudioIoOutput extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
-    this.capacity = 65536;
+    const opts = (options && options.processorOptions) || {};
+    let capacity = opts.capacity;
+    // The ring masks positions with capacity-1, so capacity must be a
+    // positive power of two; fall back to the historical default otherwise.
+    if (!(capacity > 0) || (capacity & (capacity - 1)) !== 0) {
+      capacity = 65536;
+    }
+    this.capacity = capacity;
     this.mask = this.capacity - 1;
     this.buf = new Float32Array(this.capacity);
     this.head = 0;
@@ -346,6 +354,7 @@ class AudioIoWeb extends AudioIoImpl {
   bool _isRunning = false;
   bool _inputRequested = false;
   double _requestedFrameDuration = 0.003; // Default 3ms (Balanced)
+  double? _requestedOutputBufferSeconds;
   int _bufferSize = _minBufferSize;
   AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
   MediaStreamAudioSourceNode? _inputSourceNode;
@@ -412,6 +421,11 @@ class AudioIoWeb extends AudioIoImpl {
   }
 
   int _calculateRingFrames() {
+    final seconds = _requestedOutputBufferSeconds;
+    if (seconds != null && seconds > 0) {
+      final frames = (seconds * _contractSampleRate).round();
+      return frames > _minRingFrames ? frames : _minRingFrames;
+    }
     final requested = (_requestedFrameDuration *
             _contractSampleRate *
             _ringDurationMultiplier)
@@ -484,8 +498,19 @@ class AudioIoWeb extends AudioIoImpl {
       await _audioContext!.audioWorklet.addModule(url).toDart;
       _workletModuleLoaded = true;
 
-      final node = AudioWorkletNodeJs(_audioContext!, _outputProcessorName)
-        ..connect(_audioContext!.destination);
+      // Size the worklet's ring to hold outputBufferDuration at the context
+      // rate (the rate its ring stores post-resample). Without this the ring
+      // is a fixed 65536 frames (~1.37 s at 48 kHz) regardless of the
+      // configured duration, so multi-second pushes truncate — the
+      // ScriptProcessor fallback honoured the duration but the worklet, the
+      // primary path, did not.
+      final capacity = outputWorkletCapacityFrames(
+          _requestedOutputBufferSeconds, _audioContext!.sampleRate);
+      final processorOptions = JSObject()..['capacity'] = capacity.toJS;
+      final options = JSObject()..['processorOptions'] = processorOptions;
+      final node =
+          AudioWorkletNodeJs(_audioContext!, _outputProcessorName, options)
+            ..connect(_audioContext!.destination);
       _workletNode = node;
 
       _outputController!.stream.listen((data) {
@@ -782,6 +807,18 @@ class AudioIoWeb extends AudioIoImpl {
     _requestedFrameDuration = duration;
 
     // If already running, restart with new buffer size
+    if (_isRunning) {
+      await stop();
+      await start();
+    }
+  }
+
+  @override
+  Future<void> requestOutputBufferDuration(double seconds) async {
+    _requestedOutputBufferSeconds = seconds;
+
+    // If already running, restart so the output ring is rebuilt at the new
+    // size (the ScriptProcessor / worklet ring is created at start).
     if (_isRunning) {
       await stop();
       await start();

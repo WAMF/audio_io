@@ -15,6 +15,7 @@ class AudioIoNative extends AudioIoImpl {
   AudioIoThreading _threading = AudioIoThreading.mainIsolate;
   AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
   double? _requestedFrameDuration;
+  double? _requestedOutputBufferDuration;
 
   @override
   bool get usePlatformImpl =>
@@ -59,8 +60,7 @@ class AudioIoNative extends AudioIoImpl {
       await _transport!.stop();
       _transport = null;
     }
-    _transport ??=
-        wantIsolate ? AudioIoFFIIsolateProxy() : AudioIoFFI.instance;
+    _transport ??= wantIsolate ? AudioIoFFIIsolateProxy() : AudioIoFFI.instance;
 
     // Re-applied on every start so a requested duration survives a
     // threading-mode transport swap (a fresh transport starts from its own
@@ -73,6 +73,10 @@ class AudioIoNative extends AudioIoImpl {
     // (duplex mic vs. loopback capture + playback), which is fixed at
     // device-init time.
     _transport!.setInputSource(_inputSource);
+    final outputBuffer = _requestedOutputBufferDuration;
+    if (outputBuffer != null) {
+      await _transport!.requestOutputBufferDuration(outputBuffer);
+    }
     await _transport!.start();
   }
 
@@ -95,6 +99,12 @@ class AudioIoNative extends AudioIoImpl {
   Future<void> requestFrameDuration(double duration) async {
     _requestedFrameDuration = duration;
     await _transport?.requestFrameDuration(duration);
+  }
+
+  @override
+  Future<void> requestOutputBufferDuration(double seconds) async {
+    _requestedOutputBufferDuration = seconds;
+    await _transport?.requestOutputBufferDuration(seconds);
   }
 
   @override

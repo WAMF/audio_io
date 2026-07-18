@@ -76,6 +76,7 @@ class AudioIoConfig {
     this.latency = AudioIoLatency.Balanced,
     this.threading = AudioIoThreading.mainIsolate,
     this.inputSource = AudioIoInputSource.microphone,
+    this.outputBufferDuration,
   });
 
   /// Rate the [AudioIo.inputBytes] / [AudioIo.outputBytes] streams use.
@@ -98,6 +99,20 @@ class AudioIoConfig {
   /// [AudioIoException.isSystemAudioUnsupported] on platforms/backends that
   /// cannot provide it.
   final AudioIoInputSource inputSource;
+
+  /// Optional cap on how much audio the output ring may hold, in seconds of
+  /// the 48 kHz playback contract.
+  ///
+  /// Sizes the playback ring independently of [latency] / the frame
+  /// duration, so latency-sensitive callers can cap queued output low
+  /// (barge-in) while burst producers (e.g. Gemini Live) can size it high
+  /// enough that a multi-second response is not dropped. Each back end still
+  /// enforces a small safety floor, so values below it are clamped up.
+  ///
+  /// When null (the default), each back end keeps its existing sizing
+  /// (derived from the frame duration on Apple/web, a fixed default on the
+  /// FFI back ends) — no behaviour change.
+  final double? outputBufferDuration;
 }
 
 class AudioIo {
@@ -202,6 +217,10 @@ class AudioIo {
       _impl.configureThreading(config.threading);
       _impl.configureInputSource(config.inputSource);
       await requestLatency(config.latency);
+      final outputBufferDuration = config.outputBufferDuration;
+      if (outputBufferDuration != null) {
+        await requestOutputBufferDuration(outputBufferDuration);
+      }
       await start();
       if (config.format == AudioIoFormat.pcm16) {
         await _wirePcm16Adapters(config.sampleRate.hz);
@@ -272,6 +291,19 @@ class AudioIo {
   /// take effect on platforms that size buffers at startup.
   Future<void> requestFrameDuration(double seconds) async {
     await _impl.requestFrameDuration(seconds);
+  }
+
+  /// Requests the output playback ring hold roughly [seconds] of audio at the
+  /// 48 kHz playback contract, independent of the frame duration / latency.
+  ///
+  /// Lets latency-sensitive callers cap queued output low so a barge-in drops
+  /// less stale audio, and burst producers size it high enough that a
+  /// multi-second response is not dropped. Each back end enforces a small
+  /// safety floor, so smaller values are clamped up. Must be called before
+  /// [start] to take effect on platforms that size the ring at startup;
+  /// [startWith] applies [AudioIoConfig.outputBufferDuration] automatically.
+  Future<void> requestOutputBufferDuration(double seconds) async {
+    await _impl.requestOutputBufferDuration(seconds);
   }
 
   Future<double> currentLatency() async {

@@ -22,7 +22,8 @@ void main() {
     setUp(() {
       // Broadcast so the adapter can re-listen the engine input across wires.
       engineInput = StreamController<List<double>>.broadcast();
-      engineOutput = StreamController<List<double>>.broadcast()..stream.listen((_) {});
+      engineOutput = StreamController<List<double>>.broadcast()
+        ..stream.listen((_) {});
     });
 
     tearDown(() {
