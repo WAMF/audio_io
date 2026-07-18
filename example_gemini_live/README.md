@@ -41,6 +41,30 @@ tap connect, allow microphone access, and start talking.
   reopened on `turnComplete` / `interrupted`, with a watchdog that recovers if
   an end-of-turn signal is dropped.
 
+## Limitations
+
+This example is deliberately **half-duplex**: while the model is speaking the
+mic is fully muted, so you cannot interrupt Gemini by voice ("barge-in"). The
+mute exists to stop the model hearing its own playback and talking over itself.
+`audio_io` provides no built-in acoustic echo cancellation on any platform
+(the shipped iOS backend uses a plain `.playAndRecord` session with no
+voice-processing I/O), so on every platform an always-open mic would feed the
+model's audio straight back into the WebSocket. Full-duplex barge-in was
+therefore left out of the example rather than shipped as behaviour that would
+echo on every platform.
+
+A fuller integration that wanted barge-in would keep streaming mic audio during
+playback and rely on Gemini's own VAD `interrupted` signal to stop playback (the
+example already handles `interrupted` by flushing the queue and reopening the
+mic), and/or gate the mic on a local VAD/energy threshold instead of muting
+outright — both only safe once echo cancellation is available on the target
+platform.
+
+The mute is **self-healing**: if a turn's audio stops arriving without a
+`turnComplete` / `interrupted` signal (a dropped socket message, say), a
+watchdog timer resumes the mic shortly after the estimated playback end, so it
+never sticks muted for the rest of the session.
+
 ## Microphone permission
 
 The native `AppDelegate` requests microphone access on launch
