@@ -1,5 +1,11 @@
 ## Unreleased
 
+- PCM16: asymmetric input/output sample rates. `AudioIoConfig` gains optional
+  `inputSampleRate` / `outputSampleRate`; each direction resamples to and from
+  the fixed 48 kHz engine contract independently, so callers can run e.g. a
+  16 kHz mic and a 24 kHz speaker (OpenAI Realtime / Gemini Live). `sampleRate`
+  is retained as a shorthand that sets both — either field falls back to it
+  when omitted, so existing single-rate callers are unchanged (#41).
 - iOS/macOS: the audio data plane now runs over FFI on the AVAudioEngine ring
   buffers instead of `FlutterBinaryMessenger`. `AudioIoThreading.audioIsolate`
   now works on iOS and macOS (the transport can run off the root isolate);

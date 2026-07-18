@@ -72,15 +72,32 @@ enum AudioIoSampleRate {
 class AudioIoConfig {
   const AudioIoConfig({
     this.sampleRate = AudioIoSampleRate.rate48000,
+    AudioIoSampleRate? inputSampleRate,
+    AudioIoSampleRate? outputSampleRate,
     this.format = AudioIoFormat.float64,
     this.latency = AudioIoLatency.Balanced,
     this.threading = AudioIoThreading.mainIsolate,
     this.inputSource = AudioIoInputSource.microphone,
     this.outputBufferDuration,
-  });
+  })  : inputSampleRate = inputSampleRate ?? sampleRate,
+        outputSampleRate = outputSampleRate ?? sampleRate;
 
-  /// Rate the [AudioIo.inputBytes] / [AudioIo.outputBytes] streams use.
+  /// Shorthand rate applied to both directions. Sets [inputSampleRate] and
+  /// [outputSampleRate] unless either is given explicitly.
+  ///
+  /// The byte streams are asymmetric-capable: pass [inputSampleRate] /
+  /// [outputSampleRate] to run each direction at a different rate (e.g. mic
+  /// 16 kHz in / speaker 24 kHz out, matching OpenAI Realtime and Gemini
+  /// Live). Callers that only need one rate keep passing [sampleRate].
   final AudioIoSampleRate sampleRate;
+
+  /// Rate the [AudioIo.inputBytes] stream is delivered at. Resolves to
+  /// [sampleRate] when not given explicitly.
+  final AudioIoSampleRate inputSampleRate;
+
+  /// Rate the [AudioIo.outputBytes] sink expects. Resolves to [sampleRate]
+  /// when not given explicitly.
+  final AudioIoSampleRate outputSampleRate;
 
   /// Wire format for the byte streams.
   final AudioIoFormat format;
@@ -141,13 +158,15 @@ class AudioIo {
   /// session was started with [start] or has been stopped.
   AudioIoConfig? get currentConfig => _config;
 
-  /// PCM16 (Int16 little-endian) input stream at [AudioIoConfig.sampleRate].
+  /// PCM16 (Int16 little-endian) input stream at
+  /// [AudioIoConfig.inputSampleRate].
   ///
   /// Active after [startWith] with [AudioIoFormat.pcm16]. Resampled from the
   /// engine's capture rate and encoded from the underlying [input] stream.
   Stream<Uint8List> get inputBytes => _pcm16.inputBytes;
 
-  /// PCM16 (Int16 little-endian) output sink at [AudioIoConfig.sampleRate].
+  /// PCM16 (Int16 little-endian) output sink at
+  /// [AudioIoConfig.outputSampleRate].
   ///
   /// Active after [startWith] with [AudioIoFormat.pcm16]. Decoded and
   /// resampled to the engine's 48 kHz contract before reaching [output].
@@ -193,12 +212,13 @@ class AudioIo {
     }
   }
 
-  /// Starts the engine and, for [AudioIoFormat.pcm16], wires the
-  /// [inputBytes] / [outputBytes] streams at [AudioIoConfig.sampleRate].
+  /// Starts the engine and, for [AudioIoFormat.pcm16], wires the [inputBytes]
+  /// / [outputBytes] streams at [AudioIoConfig.inputSampleRate] /
+  /// [AudioIoConfig.outputSampleRate].
   ///
   /// The engine runs at the fixed 48 kHz contract; the byte streams are
-  /// resampled to and from the requested rate and converted between
-  /// Float64 and Int16, so [AudioIoFormat.float64] callers keep using
+  /// resampled to and from the requested per-direction rates and converted
+  /// between Float64 and Int16, so [AudioIoFormat.float64] callers keep using
   /// [input] / [output] unchanged.
   Future<void> startWith(AudioIoConfig config) async {
     if (!_impl.supportsInputSource(config.inputSource)) {
@@ -223,7 +243,10 @@ class AudioIo {
       }
       await start();
       if (config.format == AudioIoFormat.pcm16) {
-        await _wirePcm16Adapters(config.sampleRate.hz);
+        await _wirePcm16Adapters(
+          config.inputSampleRate.hz,
+          config.outputSampleRate.hz,
+        );
       }
     } catch (_) {
       _config = null;
@@ -231,17 +254,21 @@ class AudioIo {
     }
   }
 
-  Future<void> _wirePcm16Adapters(int streamRate) async {
+  Future<void> _wirePcm16Adapters(
+    int inputStreamRate,
+    int outputStreamRate,
+  ) async {
     final format = await getFormat();
     final inputRate = _engineRate(format, 'input') ?? _contractSampleRate;
     final outputRate = _engineRate(format, 'output') ?? _contractSampleRate;
     await _pcm16.wire(
-      streamRate: streamRate,
+      inputStreamRate: inputStreamRate,
+      outputStreamRate: outputStreamRate,
       inputEngineRate: inputRate,
       outputEngineRate: outputRate,
       inputAudio: input,
       outputAudio: output,
-      directOutputBytes: _impl.pcm16OutputSink(streamRate),
+      directOutputBytes: _impl.pcm16OutputSink(outputStreamRate),
     );
   }
 
