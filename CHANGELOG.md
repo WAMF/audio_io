@@ -1,5 +1,14 @@
 ## Unreleased
 
+- `AudioIoConfig` now enforces its numeric field invariants in **all** build
+  modes: `outputBufferDuration` must be a positive, finite number of seconds.
+  Previously only a debug `assert` guarded it, which is stripped in
+  release/profile builds, so an out-of-range value (0, negative, NaN, infinity)
+  reached the native ring sizing and could cause a native crash or undefined
+  behaviour with no signal to the caller. `AudioIo.startWith` now throws an
+  `ArgumentError` for such values before the config reaches the engine
+  (mirroring the sample-rate-mismatch contract guard). Valid and null values
+  are unchanged (#9).
 - Web: the AudioContext sample-rate mismatch is now handled by transparent
   Dart-side resampling — `startWith` accepts any supported `AudioIoSampleRate`
   on the web without throwing (the earlier `allowSampleRateMismatch` guard is
