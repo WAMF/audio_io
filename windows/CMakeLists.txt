@@ -38,6 +38,10 @@ set_target_properties(audio_io PROPERTIES
   CXX_STANDARD 14
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF
+  # MSVC exports no symbols by default, so the Dart FFI lookups against
+  # audio_io.dll (audio_io_create, audio_io_start, ...) would fail to
+  # resolve. Export all symbols of the C API so DynamicLibrary.lookup works.
+  WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
 # List of absolute paths to libraries that should be bundled with the plugin

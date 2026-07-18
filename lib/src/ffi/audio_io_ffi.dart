@@ -5,6 +5,8 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 
+import '../audio_io_errors.dart';
+import '../audio_io_input_source.dart';
 import 'audio_io_bindings.dart';
 
 /// Common surface of the FFI transports so the platform layer can swap the
@@ -19,6 +21,10 @@ abstract class AudioIoFFITransport {
   Map<String, dynamic> getFormat();
   Future<void> requestFrameDuration(double duration);
   Future<double> getFrameDuration();
+
+  /// Selects the capture source applied at the next [start]. Fixed at
+  /// device-init time, so it must be set before [start].
+  void setInputSource(AudioIoInputSource source);
 }
 
 /// Core FFI engine shared by the main-isolate and audio-isolate transports.
@@ -33,6 +39,10 @@ class AudioIoFFICore {
 
   static const pollInterval = Duration(milliseconds: 5);
   static const _maxChunkFrames = 4800;
+
+  /// Native `audio_io_start` return code for an input source that the current
+  /// OS/backend cannot provide (see `audio_io_init_device` in the C layer).
+  static const _startUnsupportedInputSource = -2;
   static const defaultFormat = <String, dynamic>{
     'input': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
     'output': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
@@ -43,6 +53,7 @@ class AudioIoFFICore {
   Timer? _inputTimer;
   bool _isRunning = false;
   double _requestedFrameDuration = 0.003;
+  int _inputSource = 0;
 
   Pointer<Double> _readBuffer = nullptr;
   int _readCapacity = 0;
@@ -62,9 +73,18 @@ class AudioIoFFICore {
     }
 
     _bindings.setFrameDuration(handle, _requestedFrameDuration);
+    _bindings.setInputSource(handle, _inputSource);
 
-    if (_bindings.start(handle) != 0) {
+    final startResult = _bindings.start(handle);
+    if (startResult != 0) {
       _bindings.destroy(handle);
+      if (startResult == _startUnsupportedInputSource) {
+        throw const InputSourceUnsupportedException(
+          'System audio capture is unavailable on this system. WASAPI '
+          'process-excluded loopback requires Windows 11 or Windows Server '
+          '2022 (build 20348) or newer.',
+        );
+      }
       throw Exception('Failed to start audio device');
     }
 
@@ -150,6 +170,13 @@ class AudioIoFFICore {
     if (handle != null) {
       _bindings.setFrameDuration(handle, duration);
     }
+  }
+
+  /// Records the capture source (0 = microphone, 1 = system audio) to apply
+  /// when the native device is created at the next [start]. Not changeable
+  /// while running, since it fixes the device topology.
+  void setInputSource(int source) {
+    _inputSource = source;
   }
 
   /// The device's actual frame duration when running, otherwise the
@@ -243,6 +270,10 @@ class AudioIoFFI implements AudioIoFFITransport {
   Future<void> requestFrameDuration(double duration) async {
     _core.setFrameDuration(duration);
   }
+
+  @override
+  void setInputSource(AudioIoInputSource source) =>
+      _core.setInputSource(source.index);
 
   @override
   Future<double> getFrameDuration() async => _core.getFrameDuration();

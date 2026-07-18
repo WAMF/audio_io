@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import '../audio_io_errors.dart';
+import '../audio_io_input_source.dart';
 import 'audio_io_ffi.dart';
 
 class _Protocol {
@@ -35,8 +37,13 @@ void _audioIsolateMain((SendPort ready, SendPort events) ports) {
   commands.listen((dynamic message) {
     try {
       _handleCommand(core, events, message as List<dynamic>);
+    } on InputSourceUnsupportedException catch (e) {
+      // Preserve the typed-ness across the isolate boundary: the trailing flag
+      // tells the proxy to rebuild an InputSourceUnsupportedException rather
+      // than a generic Exception, so callers still see the typed error.
+      events.send([_Protocol.error, e.message, true]);
     } on Object catch (e) {
-      events.send([_Protocol.error, e.toString()]);
+      events.send([_Protocol.error, e.toString(), false]);
     }
   });
 }
@@ -47,6 +54,7 @@ void _handleCommand(
   switch (command) {
     case _Protocol.start:
       core.setFrameDuration(message[1] as double);
+      core.setInputSource(message[2] as int);
       core.start((frames) => events.send([_Protocol.input, frames]));
       events.send([_Protocol.state, core.getFormat(), core.getFrameDuration()]);
     case _Protocol.write:
@@ -86,6 +94,7 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
   Map<String, dynamic> _format = AudioIoFFICore.defaultFormat;
   double _frameDuration = 0.003;
   double _requestedFrameDuration = 0.003;
+  int _requestedInputSource = 0;
   bool _isRunning = false;
 
   @override
@@ -126,7 +135,8 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
 
     final startCompleter = Completer<void>();
     _startCompleter = startCompleter;
-    _commands!.send([_Protocol.start, _requestedFrameDuration]);
+    _commands!
+        .send([_Protocol.start, _requestedFrameDuration, _requestedInputSource]);
     try {
       await startCompleter.future;
       _isRunning = true;
@@ -164,6 +174,11 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
   }
 
   @override
+  void setInputSource(AudioIoInputSource source) {
+    _requestedInputSource = source.index;
+  }
+
+  @override
   Future<double> getFrameDuration() async => _frameDuration;
 
   void _forwardWrite(List<double> data) {
@@ -183,7 +198,11 @@ class AudioIoFFIIsolateProxy implements AudioIoFFITransport {
         _startCompleter?.complete();
         _startCompleter = null;
       case _Protocol.error:
-        _reportError(Exception(message[1] as String));
+        final unsupportedInputSource =
+            message.length > 2 && message[2] == true;
+        _reportError(unsupportedInputSource
+            ? InputSourceUnsupportedException(message[1] as String)
+            : Exception(message[1] as String));
       case _Protocol.stopped:
         _stopCompleter?.complete();
         _stopCompleter = null;
