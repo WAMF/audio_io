@@ -234,8 +234,16 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
         let newOutputRing = AudioOutputRing(
                 minimumCapacity: outputRingCapacity())
 
+        // `.voiceChat` mode engages the system's two-way voice tuning and is the
+        // session-level half of acoustic echo cancellation. Paired with the
+        // voice-processing I/O unit enabled in setupPipelineIfNeeded(), it stops
+        // full-duplex speaker output (e.g. Gemini Live's playback) from leaking
+        // into the mic and making the model interrupt/loop when no earphones are
+        // used. `.allowBluetooth` (HFP) is added alongside `.allowBluetoothA2DP`
+        // so a Bluetooth headset still routes the duplex stream.
         try AVAudioSession.sharedInstance().setCategory(
-            .playAndRecord, options: [.allowBluetoothA2DP, .defaultToSpeaker])
+            .playAndRecord, mode: .voiceChat,
+            options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
         try AVAudioSession.sharedInstance().setPreferredIOBufferDuration(_frameDuration)
         try AVAudioSession.sharedInstance().setPreferredSampleRate(_Constants.preferedSampleRate)
 
@@ -287,6 +295,25 @@ public class SwiftAudioIoPlugin: NSObject, FlutterPlugin {
             // Setup engine and node instances
             let input = engine.inputNode
             let output = engine.mainMixerNode
+
+            // Enable Apple's voice-processing I/O unit (VPIO) on the input node.
+            // This is the acoustic-echo-cancellation engine: it references the
+            // engine's render output (the sourceNode playing Gemini's audio) and
+            // subtracts it from the captured mic signal, so full-duplex playback on
+            // the built-in speaker is no longer picked up by the mic. Must be set
+            // while the engine is stopped and *before* querying the input format,
+            // because enabling VPIO changes the node's hardware output format.
+            // Enabling on the input node also enables it on the output node (they
+            // share one Voice-Processing AU). Failure is non-fatal — fall back to
+            // the plain duplex path rather than aborting start().
+            do {
+                if !input.isVoiceProcessingEnabled {
+                    try input.setVoiceProcessingEnabled(true)
+                }
+            } catch {
+                print("setupPipeline: voice processing (echo cancellation) unavailable: \(error)")
+            }
+
             let inputFormat = input.inputFormat(forBus: 0)
             _sampleRate = inputFormat.sampleRate
             inputConverter.outputVolume = 1.0
