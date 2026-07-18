@@ -23,6 +23,7 @@ class MyApp extends StatefulWidget {
 class _MyAppState extends State<MyApp> {
   String _status = 'Unknown';
   AudioIoLatency _latencyValue = AudioIoLatency.Balanced;
+  AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
   double _inputLevel = 0.0;
   DateTime _lastVolumeUpdate = DateTime.now();
   static const _volumeUpdateInterval = Duration(milliseconds: 33); // ~30 FPS
@@ -48,38 +49,73 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
-  void _setupAudioProcessing() {
+  void _setupAudioProcessing(AudioIoInputSource inputSource) {
     _audioSubscription?.cancel();
-    _audioSubscription = AudioIo.instance.input.listen((data) {
-      // Calculate RMS (Root Mean Square) for volume level
-      final now = DateTime.now();
-      if (now.difference(_lastVolumeUpdate) >= _volumeUpdateInterval) {
-        double sum = 0;
-        for (final sample in data) {
-          sum += sample * sample;
-        }
-        final rms = data.isEmpty ? 0.0 : sqrt(sum / data.length);
+    _audioSubscription = AudioIo.instance.input.listen(
+      (data) {
+        // Calculate RMS (Root Mean Square) for volume level
+        final now = DateTime.now();
+        if (now.difference(_lastVolumeUpdate) >= _volumeUpdateInterval) {
+          double sum = 0;
+          for (final sample in data) {
+            sum += sample * sample;
+          }
+          final rms = data.isEmpty ? 0.0 : sqrt(sum / data.length);
 
-        // Update UI with amplified value for better visualization
-        if (mounted) {
-          setState(() {
-            _inputLevel = (rms * 5.0).clamp(0.0, 1.0);
-            _lastVolumeUpdate = now;
-          });
+          // Update UI with amplified value for better visualization
+          if (mounted) {
+            setState(() {
+              _inputLevel = (rms * 5.0).clamp(0.0, 1.0);
+              _lastVolumeUpdate = now;
+            });
+          }
         }
-      }
 
-      final out = List<double>.generate(
-          data.length, (index) => data[index] * 0.9); // do things :)
-      AudioIo.instance.output
-          .add(out); // send back out to output (headset speaker or headphones)
-    });
+        // Echo the microphone back to the speaker. For system/tab audio we
+        // only visualise the level: replaying captured system audio would
+        // feed straight back into the capture and loop. Use the session's
+        // captured source, not the mutable field: changing the selector mid
+        // capture must not divert a live system-audio stream into the echo
+        // branch.
+        if (inputSource == AudioIoInputSource.microphone) {
+          final out = List<double>.generate(
+              data.length, (index) => data[index] * 0.9); // do things :)
+          AudioIo.instance.output.add(out);
+        }
+      },
+      onError: (Object e) {
+        // System/tab audio on a non-Chromium browser surfaces here as a typed
+        // AudioIoException with isSystemAudioUnsupported.
+        if (!mounted) return;
+        setState(() {
+          _status = e is AudioIoException && e.isSystemAudioUnsupported
+              ? 'System audio unavailable (Chromium only): ${e.message}'
+              : 'Input error: $e';
+          _inputLevel = 0.0;
+        });
+      },
+      onDone: () {
+        // The share ended (user clicked "Stop sharing" in the browser).
+        if (!mounted) return;
+        setState(() {
+          _status = 'Sharing stopped';
+          _inputLevel = 0.0;
+        });
+      },
+    );
   }
 
   void startAudio() async {
+    // Snapshot the selected source for the whole session. _inputSource is
+    // mutable from the selector; capturing it once keeps permission checks,
+    // processing, config, and status consistent even if the user changes the
+    // selector while capture is running.
+    final inputSource = _inputSource;
     try {
-      // Only check permissions on mobile platforms
-      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+      // Only check microphone permission when actually using the mic.
+      if (!kIsWeb &&
+          defaultTargetPlatform == TargetPlatform.android &&
+          inputSource == AudioIoInputSource.microphone) {
         final status = await Permission.microphone.request();
         if (!status.isGranted) {
           setState(() {
@@ -89,17 +125,38 @@ class _MyAppState extends State<MyApp> {
         }
       }
 
-      // Set the latency preference before starting
-      await AudioIo.instance.requestLatency(_latencyValue);
+      // Subscribe to the input stream BEFORE startWith. On web the share
+      // picker (getDisplayMedia) is triggered during start() and must run
+      // while the initiating tap still carries transient user activation; if
+      // we subscribed only after awaiting startWith, the picker would fire
+      // outside that window and be rejected. The input stream is stable before
+      // start, so this early listener stays attached and receives capture data
+      // and the typed picker error.
+      _setupAudioProcessing(inputSource);
 
-      await AudioIo.instance.start();
-      _setupAudioProcessing(); // Set up audio processing after starting
+      // startWith applies the latency and input source together. On web,
+      // AudioIoInputSource.systemAudio triggers the browser's share picker
+      // during start because a listener is already attached (above).
+      await AudioIo.instance.startWith(
+        AudioIoConfig(
+          latency: _latencyValue,
+          inputSource: inputSource,
+        ),
+      );
 
       final latency = await AudioIo.instance.currentLatency();
       final lstring = latency.toStringAsPrecision(2);
       await AudioIo.instance.getFormat();
       setState(() {
-        _status = 'Started ($lstring ms)';
+        _status = inputSource == AudioIoInputSource.systemAudio
+            ? 'Started — pick a tab to share ($lstring ms)'
+            : 'Started ($lstring ms)';
+      });
+    } on AudioIoException catch (e) {
+      setState(() {
+        _status = e.isSystemAudioUnsupported
+            ? 'System audio not available: ${e.message}'
+            : 'Failed: ${e.message}';
       });
     } on PlatformException {
       setState(() {
@@ -136,6 +193,9 @@ class _MyAppState extends State<MyApp> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               latencyDropdown(context),
+              const SizedBox(height: 8),
+              inputSourceSelector(context),
+              const SizedBox(height: 8),
               Text('Status: $_status\n'),
               Padding(
                 padding:
@@ -165,6 +225,29 @@ class _MyAppState extends State<MyApp> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget inputSourceSelector(BuildContext context) {
+    return SegmentedButton<AudioIoInputSource>(
+      segments: const [
+        ButtonSegment(
+          value: AudioIoInputSource.microphone,
+          label: Text('Microphone'),
+          icon: Icon(Icons.mic),
+        ),
+        ButtonSegment(
+          value: AudioIoInputSource.systemAudio,
+          label: Text('System / tab audio'),
+          icon: Icon(Icons.desktop_windows),
+        ),
+      ],
+      selected: {_inputSource},
+      onSelectionChanged: (selection) {
+        setState(() {
+          _inputSource = selection.first;
+        });
+      },
     );
   }
 

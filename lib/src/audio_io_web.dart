@@ -5,8 +5,19 @@ import 'dart:typed_data';
 
 import 'package:web/web.dart' as web;
 
+import 'audio_io_exception.dart';
+import 'audio_io_input_source.dart';
 import 'audio_io_stub.dart';
 import 'output_ring.dart';
+
+/// `MediaDevices.getDisplayMedia` is not declared in `package:web` 0.5.x, so
+/// we bind it locally. It prompts the browser's screen/tab/window share
+/// picker (must be called from a user gesture) and resolves to a
+/// [web.MediaStream]. On Chromium the stream carries an audio track with the
+/// captured tab/system audio; Firefox and Safari resolve a video-only stream.
+extension MediaDevicesDisplayMediaExt on web.MediaDevices {
+  external JSPromise<web.MediaStream> getDisplayMedia([JSObject options]);
+}
 
 @JS('AudioContext')
 @staticInterop
@@ -39,6 +50,7 @@ extension MediaStreamAudioSourceNodeExt on MediaStreamAudioSourceNode {
   external void connect(ScriptProcessorNode node);
   @JS('connect')
   external void connectWorklet(AudioWorkletNodeJs node);
+  external void disconnect();
 }
 
 @JS()
@@ -335,12 +347,43 @@ class AudioIoWeb extends AudioIoImpl {
   bool _inputRequested = false;
   double _requestedFrameDuration = 0.003; // Default 3ms (Balanced)
   int _bufferSize = _minBufferSize;
+  AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
+  MediaStreamAudioSourceNode? _inputSourceNode;
+  web.MediaStream? _inputMediaStream;
 
   @override
   bool get usePlatformImpl => true;
 
   @override
-  Stream<List<double>>? get inputAudioStream => _inputController?.stream;
+  void configureInputSource(AudioIoInputSource source) {
+    _inputSource = source;
+  }
+
+  @override
+  bool supportsInputSource(AudioIoInputSource source) {
+    // Both the microphone (getUserMedia) and system/tab audio
+    // (getDisplayMedia) are reachable in the browser. getDisplayMedia only
+    // yields an audio track on Chromium, but that can't be detected until
+    // the user has answered the share picker, so the "no audio track"
+    // failure surfaces at start time as an [AudioIoException] with
+    // [AudioIoException.isSystemAudioUnsupported] rather than here.
+    return true;
+  }
+
+  @override
+  Stream<List<double>>? get inputAudioStream => _ensureInputController().stream;
+
+  /// The input stream must exist *before* [start], so a listener that
+  /// subscribes before `startWith` attaches to the real controller rather than
+  /// a throwaway `Stream.empty()` and still receives the getDisplayMedia picker
+  /// error (delivered via [_connectInputIfNeeded]'s `addError`). Created lazily
+  /// and reused across a start; broadcast so a listen-before-start and a
+  /// listen-after-start both work and multiple listeners are allowed.
+  StreamController<List<double>> _ensureInputController() {
+    return _inputController ??= StreamController<List<double>>.broadcast(
+      onListen: _connectInputIfNeeded,
+    );
+  }
 
   @override
   StreamSink<List<double>>? get outputAudioStream => _outputController?.sink;
@@ -405,11 +448,11 @@ class AudioIoWeb extends AudioIoImpl {
       final sampleRate = _audioContext!.sampleRate;
       _bufferSize = _calculateBufferSize(sampleRate);
 
-      // Request the microphone lazily so output-only users never see a
-      // permission prompt.
-      _inputController = StreamController<List<double>>.broadcast(
-        onListen: _connectInputIfNeeded,
-      );
+      // Reuse the controller a pre-start listener may already hold so its
+      // subscription stays attached across start (and receives input/errors);
+      // create it here if nothing has listened yet. The microphone is still
+      // requested lazily via onListen, so output-only users see no prompt.
+      _ensureInputController();
       _outputController = StreamController<List<double>>();
 
       final workletStarted = await _tryStartWorkletOutput();
@@ -516,16 +559,108 @@ class AudioIoWeb extends AudioIoImpl {
     if (_inputRequested || !_isRunning) return;
     _inputRequested = true;
 
-    final mediaStream = await _getUserMedia();
+    final web.MediaStream? mediaStream;
+    try {
+      mediaStream = _inputSource == AudioIoInputSource.systemAudio
+          ? await _acquireSystemAudioStream()
+          : await _getUserMedia();
+    } on AudioIoException catch (e) {
+      // Surface the typed failure through the input stream's error channel so
+      // listeners see it regardless of whether they subscribed before or
+      // after start(); allow another attempt on a later restart.
+      _inputRequested = false;
+      _inputController?.addError(e);
+      return;
+    }
+
     final context = _audioContext;
     if (mediaStream == null || context == null) return;
+    _inputMediaStream = mediaStream;
 
     final source = context.createMediaStreamSource(mediaStream);
+    _inputSourceNode = source;
     if (_workletModuleLoaded) {
       source.connectWorklet(_createInputWorkletNode(context));
       return;
     }
     source.connect(_scriptProcessor ?? _createInputProcessor(context));
+  }
+
+  /// Captures system / tab audio via `getDisplayMedia`. The picker is a
+  /// user-driven share dialog, so `start()` (already user-gesture-adjacent)
+  /// triggers it. The video track is required for the picker but immediately
+  /// stopped; only the audio track feeds the graph.
+  ///
+  /// Throws an [AudioIoException] with
+  /// [AudioIoException.isSystemAudioUnsupported] when the browser returns no
+  /// audio track (Firefox / Safari implement `getDisplayMedia` but never
+  /// deliver audio) or when the picker call itself fails / is dismissed.
+  Future<web.MediaStream> _acquireSystemAudioStream() async {
+    final web.MediaStream stream;
+    try {
+      // suppressLocalAudioPlayback defaults to false, so a shared tab keeps
+      // playing out of the speakers — the right UX for a listening demo.
+      // systemAudio: 'include' asks for full-system audio when the user
+      // shares an entire screen (Chromium honours it; others ignore it).
+      final options = JSObject()
+        ..['audio'] = true.toJS
+        ..['video'] = true.toJS
+        ..['systemAudio'] = 'include'.toJS;
+      stream = await web.window.navigator.mediaDevices
+          .getDisplayMedia(options)
+          .toDart;
+    } catch (e) {
+      throw AudioIoException(
+        AudioIoErrorCodes.systemAudioUnsupported,
+        'System-audio capture via getDisplayMedia failed or was dismissed: $e',
+      );
+    }
+
+    final videoTracks = stream.getVideoTracks().toDart;
+    for (final track in videoTracks) {
+      track.stop();
+    }
+
+    final audioTracks = stream.getAudioTracks().toDart;
+    if (audioTracks.isEmpty) {
+      throw AudioIoException(
+        AudioIoErrorCodes.systemAudioUnsupported,
+        'This browser returned a screen-capture stream with no audio track. '
+        'System/tab audio capture is only supported on Chromium browsers '
+        '(Chrome/Edge); Firefox and Safari do not deliver audio.',
+      );
+    }
+
+    // "Stop sharing" (browser UI) ends the track; surface it downstream.
+    audioTracks.first.onended = ((web.Event _) {
+      _handleInputTrackEnded();
+    }).toJS;
+
+    return stream;
+  }
+
+  /// The user stopped the screen/tab share from the browser UI. Tear down the
+  /// input node and complete the input stream so listeners see the end of
+  /// capture; output (e.g. TTS playback) keeps running.
+  void _handleInputTrackEnded() {
+    _inputSourceNode?.disconnect();
+    _inputSourceNode = null;
+    _stopInputMediaStream();
+    _inputRequested = false;
+    final controller = _inputController;
+    if (controller != null && !controller.isClosed) {
+      unawaited(controller.close());
+      _inputController = null;
+    }
+  }
+
+  void _stopInputMediaStream() {
+    final stream = _inputMediaStream;
+    if (stream == null) return;
+    for (final track in stream.getTracks().toDart) {
+      track.stop();
+    }
+    _inputMediaStream = null;
   }
 
   /// Input AudioWorkletNode: resamples to the 48 kHz contract on the audio
@@ -601,6 +736,9 @@ class AudioIoWeb extends AudioIoImpl {
 
     _isRunning = false;
     _inputRequested = false;
+    _inputSourceNode?.disconnect();
+    _inputSourceNode = null;
+    _stopInputMediaStream();
     _scriptProcessor?.disconnect();
     _scriptProcessor = null;
     _releaseWorklet();

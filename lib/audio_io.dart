@@ -1,33 +1,29 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'src/audio_io_exception.dart';
+import 'src/audio_io_input_source.dart';
 import 'src/audio_io_threading.dart';
 import 'src/pcm16_adapters.dart';
+
+// The base implementation type, used to type the (optionally injected)
+// backend. All three conditional implementations extend this class.
+import 'src/audio_io_stub.dart' show AudioIoImpl;
 
 // Conditional imports for platform-specific implementations
 import 'src/audio_io_stub.dart'
     if (dart.library.io) 'src/audio_io_native.dart'
     if (dart.library.js_interop) 'src/audio_io_web.dart' as impl;
 
+export 'src/audio_io_exception.dart';
+export 'src/audio_io_input_source.dart';
 export 'src/audio_io_threading.dart';
 
-class _ErrorCodes {
-  static const microphonePermissionDenied = 'MICROPHONE_PERMISSION_DENIED';
-}
-
-class AudioIoException implements Exception {
-  AudioIoException(this.code, this.message, [this.details]);
-
-  final String code;
-  final String message;
-  final dynamic details;
-
-  bool get isPermissionDenied => code == _ErrorCodes.microphonePermissionDenied;
-
-  @override
-  String toString() => 'AudioIoException($code): $message';
-}
+// AudioIoException and its error codes live in
+// `src/audio_io_exception.dart` (re-exported above) so platform
+// implementations can raise typed errors without a circular import.
 
 class _Constants {
   static const millisecPerSec = 1000;
@@ -78,6 +74,7 @@ class AudioIoConfig {
     this.format = AudioIoFormat.float64,
     this.latency = AudioIoLatency.Balanced,
     this.threading = AudioIoThreading.mainIsolate,
+    this.inputSource = AudioIoInputSource.microphone,
   });
 
   /// Rate the [AudioIo.inputBytes] / [AudioIo.outputBytes] streams use.
@@ -92,16 +89,32 @@ class AudioIoConfig {
   /// Where the audio transport runs; see [AudioIoThreading]. Optional:
   /// defaults to the main isolate, which every platform supports.
   final AudioIoThreading threading;
+
+  /// Which source the input stream captures from. Defaults to
+  /// [AudioIoInputSource.microphone]. [AudioIoInputSource.systemAudio]
+  /// captures the machine's audio mix (Windows via WASAPI loopback, macOS
+  /// via Core Audio taps) and throws an [AudioIoException] with
+  /// [AudioIoException.isSystemAudioUnsupported] on platforms/backends that
+  /// cannot provide it.
+  final AudioIoInputSource inputSource;
 }
 
 class AudioIo {
   AudioIoLatency frameSize = AudioIoLatency.Balanced;
   static AudioIo instance = AudioIo();
 
+  AudioIo() : _impl = impl.createAudioIoImpl();
+
+  /// Injects a specific backend, for tests that need to observe the
+  /// [start] / [stop] / [startWith] control flow without a real platform
+  /// engine (e.g. the input-source reset contract).
+  @visibleForTesting
+  AudioIo.withImpl(AudioIoImpl backend) : _impl = backend;
+
   // Platform-specific implementation. Every platform now routes through an
   // [AudioIoImpl] (web AudioWorklet, miniaudio FFI, or the Apple AVAudioEngine
   // backend), so `AudioIo` is a thin facade with no transport of its own.
-  final _impl = impl.createAudioIoImpl();
+  final AudioIoImpl _impl;
 
   static const int _contractSampleRate = 48000;
 
@@ -139,6 +152,15 @@ class AudioIo {
       _impl.outputAudioStream ?? _fallbackController.sink;
 
   Future<void> start() async {
+    // A plain start() is the legacy microphone contract. startWith sets
+    // _config before delegating here, so an unconfigured start means the
+    // backend must be reset to the microphone: otherwise a prior
+    // startWith(systemAudio) -> stop() leaves the web backend configured for
+    // display capture and this start() would silently reopen the share
+    // picker instead of the microphone.
+    if (_config == null) {
+      _impl.configureInputSource(AudioIoInputSource.microphone);
+    }
     try {
       await _impl.start();
     } on PlatformException catch (e) {
@@ -154,12 +176,29 @@ class AudioIo {
   /// Float64 and Int16, so [AudioIoFormat.float64] callers keep using
   /// [input] / [output] unchanged.
   Future<void> startWith(AudioIoConfig config) async {
+    if (!_impl.supportsInputSource(config.inputSource)) {
+      throw AudioIoException(
+        AudioIoErrorCodes.systemAudioUnsupported,
+        'Input source ${config.inputSource.name} is not supported on this '
+        'platform or audio backend.',
+      );
+    }
+    // Assign _config transactionally: if any setup step throws, clear it so
+    // currentConfig does not report a session that never started and a later
+    // plain start() still resets to the microphone (start() only resets when
+    // _config is null).
     _config = config;
-    _impl.configureThreading(config.threading);
-    await requestLatency(config.latency);
-    await start();
-    if (config.format == AudioIoFormat.pcm16) {
-      await _wirePcm16Adapters(config.sampleRate.hz);
+    try {
+      _impl.configureThreading(config.threading);
+      _impl.configureInputSource(config.inputSource);
+      await requestLatency(config.latency);
+      await start();
+      if (config.format == AudioIoFormat.pcm16) {
+        await _wirePcm16Adapters(config.sampleRate.hz);
+      }
+    } catch (_) {
+      _config = null;
+      rethrow;
     }
   }
 
