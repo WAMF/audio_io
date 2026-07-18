@@ -32,7 +32,8 @@ void main() {
     });
 
     Future<void> wire(Pcm16Adapters adapters, int streamRate) => adapters.wire(
-          streamRate: streamRate,
+          inputStreamRate: streamRate,
+          outputStreamRate: streamRate,
           inputEngineRate: 48000,
           outputEngineRate: 48000,
           inputAudio: engineInput.stream,
@@ -65,7 +66,8 @@ void main() {
       engineOutput.stream.listen(engineSamples.add);
 
       await adapters.wire(
-        streamRate: AudioIoSampleRate.rate16000.hz,
+        inputStreamRate: AudioIoSampleRate.rate16000.hz,
+        outputStreamRate: AudioIoSampleRate.rate16000.hz,
         inputEngineRate: 48000,
         outputEngineRate: 48000,
         inputAudio: engineInput.stream,

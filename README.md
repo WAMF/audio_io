@@ -159,6 +159,23 @@ api.audioResponses.listen(audioIo.outputBytes.add);
 await audioIo.clearOutput();
 ```
 
+#### Asymmetric input / output rates
+
+`sampleRate` is a shorthand that applies to both directions. When your API
+uses a different rate per direction — e.g. OpenAI Realtime and Gemini Live
+capture at 16 kHz but return audio at 24 kHz — set `inputSampleRate` and
+`outputSampleRate` explicitly instead. Each direction is resampled to and
+from the engine's 48 kHz contract independently; either field falls back to
+`sampleRate` when omitted, so existing single-rate callers are unaffected:
+
+```dart
+await audioIo.startWith(const AudioIoConfig(
+  format: AudioIoFormat.pcm16,
+  inputSampleRate: AudioIoSampleRate.rate16000,  // mic bytes at 16 kHz
+  outputSampleRate: AudioIoSampleRate.rate24000, // playback bytes at 24 kHz
+));
+```
+
 #### Playback buffer size
 
 The output ring is sized from the frame duration by default. Set

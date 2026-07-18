@@ -35,23 +35,26 @@ class Pcm16Adapters {
       (_outputBytesController ??= StreamController<Uint8List>.broadcast()).sink;
 
   /// Wires the byte adapters around the engine's [inputAudio] / [outputAudio]
-  /// Float64 streams. [streamRate] is the rate callers see on the byte
-  /// streams; [inputEngineRate] / [outputEngineRate] are the engine's actual
-  /// capture/render rates. Re-callable: cancels any prior subscriptions first.
+  /// Float64 streams. [inputStreamRate] / [outputStreamRate] are the rates
+  /// callers see on the [inputBytes] / [outputBytes] streams (independent, so
+  /// each direction can run at a different rate); [inputEngineRate] /
+  /// [outputEngineRate] are the engine's actual capture/render rates.
+  /// Re-callable: cancels any prior subscriptions first.
   ///
   /// When [directOutputBytes] is provided (a back end that decodes and
   /// resamples PCM16 natively, like the web AudioWorklet), output bytes are
   /// forwarded to it untouched and the Dart-side decode/resample is skipped.
   Future<void> wire({
-    required int streamRate,
+    required int inputStreamRate,
+    required int outputStreamRate,
     required int inputEngineRate,
     required int outputEngineRate,
     required Stream<List<double>> inputAudio,
     required Sink<List<double>> outputAudio,
     Sink<Uint8List>? directOutputBytes,
   }) async {
-    _outputResampler = PushResampler(streamRate, outputEngineRate);
-    _inputResampler = PushResampler(inputEngineRate, streamRate);
+    _outputResampler = PushResampler(outputStreamRate, outputEngineRate);
+    _inputResampler = PushResampler(inputEngineRate, inputStreamRate);
 
     final outputBytesController =
         _outputBytesController ??= StreamController<Uint8List>.broadcast();
