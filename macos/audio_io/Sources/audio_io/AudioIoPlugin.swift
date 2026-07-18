@@ -1,18 +1,6 @@
 import AVFoundation
 import FlutterMacOS
 
-extension Data {
-    init<T>(fromArray values: [T]) {
-        self = values.withUnsafeBytes { Data($0) }
-    }
-
-    func toArray<T>(type _: T.Type) -> [T] where T: ExpressibleByIntegerLiteral {
-        var array = [T](repeating: 0, count: count / MemoryLayout<T>.stride)
-        _ = array.withUnsafeMutableBytes { copyBytes(to: $0) }
-        return array
-    }
-}
-
 enum _Constants {
     static let preferedSampleRate = 48000.0
     /// Clients always push mono Float64 at this rate; the source node is
@@ -20,7 +8,6 @@ enum _Constants {
     /// Bluetooth (44.1 kHz A2DP, 16-24 kHz HFP input) and other devices
     /// play at correct speed while the engine keeps consuming 48 k/s.
     static let outputContractSampleRate = 48000.0
-    static let workspaceSamples = 100_000
     static let defaultFrameDuration = 0.003
     static let defaultMaxFrameJitter = 4.0
     static let processingQueueName = "SwiftAudioIoPluginQueue"
@@ -45,8 +32,6 @@ enum AudioIoError {
 }
 
 enum Channels: String {
-    case inputChannelName = "com.wearemobilefirst.audio_io.inputAudio"
-    case outputChannelName = "com.wearemobilefirst.audio_io.outputAudio"
     case methodChannelName = "com.wearemobilefirst.audio_io"
 }
 
@@ -65,61 +50,32 @@ enum _AudioFormat {
     static let output = "output"
 }
 
-/// Guarded by os_unfair_lock (priority donating, no allocation) because
-/// acquire() runs on the realtime render thread; a serial DispatchQueue
-/// there can block the audio callback behind a descheduled worker.
-class DataBufferPool {
-    private var pool: [Data] = []
-    private let bufferSize: Int
-    private let poolSize: Int
-    private let lockPtr: UnsafeMutablePointer<os_unfair_lock>
-
-    init(bufferSize: Int, poolSize: Int = 8) {
-        self.bufferSize = bufferSize
-        self.poolSize = poolSize
-        lockPtr = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
-        lockPtr.initialize(to: os_unfair_lock())
-        for _ in 0..<poolSize {
-            pool.append(Data(count: bufferSize))
-        }
-    }
-
-    deinit {
-        lockPtr.deinitialize(count: 1)
-        lockPtr.deallocate()
-    }
-
-    func acquire() -> Data {
-        os_unfair_lock_lock(lockPtr)
-        defer { os_unfair_lock_unlock(lockPtr) }
-        if pool.isEmpty {
-            return Data(count: bufferSize)
-        }
-        return pool.removeLast()
-    }
-
-    func release(_ data: Data) {
-        os_unfair_lock_lock(lockPtr)
-        defer { os_unfair_lock_unlock(lockPtr) }
-        if pool.count < poolSize {
-            pool.append(data)
-        }
-    }
-}
-
 public class AudioIoPlugin: NSObject, FlutterPlugin {
+    /// Set once in `register(with:)`. The `@_cdecl` FFI data-plane exports
+    /// (see the free functions at the bottom of this file) resolve the live
+    /// plugin instance through this singleton — the Dart side reaches the
+    /// rings by process symbol via `DynamicLibrary.process()`, not through the
+    /// registrar it never sees.
+    static fileprivate(set) weak var shared: AudioIoPlugin?
+
     let engine = AVAudioEngine()
     var inputConverter = AVAudioMixerNode()
-    var _binaryMessenger: FlutterBinaryMessenger?
     var _frameDuration = _Constants.defaultFrameDuration
     var _sampleRate = _Constants.preferedSampleRate
     var buffer = AudioOutputRing(minimumCapacity: 2048)
+    var inputRing = AudioInputRing(minimumCapacity: 2048)
+    /// Guards the `buffer` / `inputRing` *references* — not their contents (the
+    /// rings are internally lock-safe). `startInternal` reassigns both to fresh
+    /// instances on every start/reset, while the `@_cdecl` FFI exports load
+    /// those references from the Dart poll/write isolate, which keeps running
+    /// through a route/interruption reset. Without this lock the swap races the
+    /// load and can free a ring mid-read or write into the discarded instance.
+    private let ringLock = NSLock()
     let maxFrameJitter = _Constants.defaultMaxFrameJitter
     let queue = DispatchQueue(label: _Constants.processingQueueName)
     var _isRunning = false
     var _isPipelineSetup = false
     var _resetting = false
-    var bufferPool: DataBufferPool?
 
     private var sourceNode: AVAudioSourceNode?
 
@@ -147,35 +103,17 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             })
     }
 
+    // Realtime capture path: write the engine's native Float32 samples straight
+    // into the lock-free input ring. No `Data` allocation, no buffer pool, no
+    // main-thread dispatch, and no per-sample Double conversion on the render
+    // thread — the Dart FFI poll loop drains the ring off-thread (see #27).
     private lazy var sinkNode = AVAudioSinkNode { [weak self] _, frames, audioBufferList -> OSStatus in
         guard let self = self else { return noErr }
-        let sampleCount = Int(frames)
         guard let ptr = audioBufferList.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self) else {
             return noErr
         }
-
-        let byteCount = sampleCount * MemoryLayout<Double>.stride
-        var doubleData = self.bufferPool?.acquire() ?? Data(count: byteCount)
-
-        if doubleData.count != byteCount {
-            doubleData = Data(count: byteCount)
-        }
-
-        doubleData.withUnsafeMutableBytes { doublePtr in
-            let doubles = doublePtr.bindMemory(to: Double.self)
-            for i in 0..<sampleCount {
-                doubles[i] = Double(ptr[i])
-            }
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self._binaryMessenger?.send(
-                onChannel: Channels.inputChannelName.rawValue, message: doubleData,
-                binaryReply: { [weak self] _ in
-                    self?.bufferPool?.release(doubleData)
-                })
-        }
+        let src = UnsafeBufferPointer(start: ptr, count: Int(frames))
+        self.inputRing.write(src)
         return noErr
     }
 
@@ -184,19 +122,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger)
         let instance = AudioIoPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
-        instance._binaryMessenger = registrar.messenger
-        instance._binaryMessenger?.setMessageHandlerOnChannel(
-            Channels.outputChannelName.rawValue,
-            binaryMessageHandler: { [weak instance] data, _ in
-                guard let data = data, let instance = instance else {
-                    return
-                }
-                autoreleasepool {
-                    data.withUnsafeBytes { rawPtr in
-                        _ = instance.buffer.write(rawPtr.bindMemory(to: Double.self))
-                    }
-                }
-            })
+        AudioIoPlugin.shared = instance
 
         NotificationCenter.default.addObserver(
             instance, selector: #selector(handleConfigChange),
@@ -235,6 +161,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         engine.stop()
         _isRunning = false
         buffer.clear()
+        inputRing.clear()
     }
 
     public func start(result: @escaping FlutterResult) {
@@ -269,7 +196,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 
     private func startInternal() throws {
-        buffer = AudioOutputRing(
+        let newOutputRing = AudioOutputRing(
                 minimumCapacity: max(
                     _Constants.ringBufferSize,
                     Int(_frameDuration * _Constants.outputContractSampleRate
@@ -277,14 +204,45 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
 
         try setupPipelineIfNeeded()
 
-        let expectedFrameSize = Int(_frameDuration * _sampleRate)
-        let bufferSize = expectedFrameSize * MemoryLayout<Double>.stride
-        bufferPool = DataBufferPool(bufferSize: bufferSize, poolSize: 8)
+        // Sized to the same jitter budget as the output ring, at the capture
+        // rate the pipeline negotiated in setupPipelineIfNeeded().
+        let newInputRing = AudioInputRing(
+            minimumCapacity: max(
+                _Constants.ringBufferSize,
+                Int(_frameDuration * _sampleRate * maxFrameJitter)))
+
+        // Publish both rings atomically under ringLock so a concurrent FFI
+        // export (Dart poll/write isolate) snapshots either the whole old or
+        // the whole new pair — never a half-swapped or freed ring. The engine
+        // is stopped across a reset before we reach here, so the realtime
+        // render/sink blocks are not reading the references during the swap and
+        // stay lock-free by design.
+        ringLock.lock()
+        buffer = newOutputRing
+        inputRing = newInputRing
+        ringLock.unlock()
 
         inputConverter.outputVolume = 1.0
 
         try engine.start()
         _isRunning = true
+    }
+
+    /// Strong snapshot of the input ring taken under `ringLock`, so the FFI
+    /// export retains the instance before the lock is released and a
+    /// `startInternal` swap cannot free it mid-use.
+    func snapshotInputRing() -> AudioInputRing {
+        ringLock.lock()
+        defer { ringLock.unlock() }
+        return inputRing
+    }
+
+    /// Strong snapshot of the output ring taken under `ringLock`; see
+    /// `snapshotInputRing()`.
+    func snapshotOutputRing() -> AudioOutputRing {
+        ringLock.lock()
+        defer { ringLock.unlock() }
+        return buffer
     }
 
     public func setupPipelineIfNeeded() throws {
@@ -353,15 +311,50 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     }
 }
 
-// AudioOutputRing lives in the shared source ios/audio_io/Sources/audio_io/AudioOutputRing.swift (shared into macOS via symlink)
-// (symlinked into macos/Classes) so the iOS and macOS copies cannot drift.
+// AudioOutputRing / AudioInputRing live in the shared sources
+// ios/audio_io/Sources/audio_io/AudioOutputRing.swift and AudioInputRing.swift
+// (symlinked into macos/audio_io/Sources/audio_io) so the iOS and macOS copies
+// cannot drift.
 
-extension Double {
-    public static var random: Double {
-        return Double(arc4random()) / 0xFFFF_FFFF
-    }
+// MARK: - FFI data plane (#27)
+//
+// C-callable exports resolved by the Dart side via `DynamicLibrary.process()`
+// (the same mechanism `AudioIoBindings` already uses on Apple platforms). Only
+// the data plane crosses FFI; engine lifecycle stays on the method channel.
+// These reach the live plugin through `AudioIoPlugin.shared`, so they are safe
+// to call from any isolate — the ring locks are the only synchronization the
+// audio path needs.
 
-    public static func random(min: Double, max: Double) -> Double {
-        return Double.random * (max - min) + min
-    }
+/// Number of captured Float32 samples currently queued for reading.
+@_cdecl("audio_io_apple_input_available")
+public func audio_io_apple_input_available() -> Int32 {
+    guard let plugin = AudioIoPlugin.shared else { return 0 }
+    return Int32(plugin.snapshotInputRing().availableToRead)
+}
+
+/// Drains up to [frames] captured Float32 samples into [buffer]; returns the
+/// number actually read (0 when empty).
+@_cdecl("audio_io_apple_input_read")
+public func audio_io_apple_input_read(
+    _ buffer: UnsafeMutablePointer<Float>, _ frames: Int32
+) -> Int32 {
+    guard let plugin = AudioIoPlugin.shared, frames > 0 else { return 0 }
+    return Int32(plugin.snapshotInputRing().read(into: buffer, maxCount: Int(frames)))
+}
+
+/// Enqueues [frames] Float64 output samples into the playback ring; returns the
+/// number accepted (the newest excess is dropped when the ring is full).
+@_cdecl("audio_io_apple_output_write")
+public func audio_io_apple_output_write(
+    _ buffer: UnsafeMutablePointer<Double>, _ frames: Int32
+) -> Int32 {
+    guard let plugin = AudioIoPlugin.shared, frames > 0 else { return 0 }
+    let samples = UnsafeBufferPointer(start: buffer, count: Int(frames))
+    return Int32(plugin.snapshotOutputRing().write(samples))
+}
+
+/// Discards output samples queued but not yet rendered (barge-in).
+@_cdecl("audio_io_apple_output_clear")
+public func audio_io_apple_output_clear() {
+    AudioIoPlugin.shared?.snapshotOutputRing().clear()
 }

@@ -74,3 +74,74 @@ class AudioOutputRingTests: XCTestCase {
     XCTAssertEqual(read(ring, 2), [9, 9], "fresh write after clear reads back cleanly")
   }
 }
+
+// MARK: - AudioInputRing coverage
+//
+// The Darwin capture path (#27) bottoms out in AudioInputRing: the Float32
+// SPSC ring the AVAudioSinkNode render block writes into and the Dart FFI poll
+// loop drains. It mirrors AudioOutputRing's index arithmetic but differs in
+// two ways worth locking: read() returns the count actually read (never
+// zero-fills — the consumer wants exactly what is available), and
+// availableToRead reports the queue depth the poll loop keys off. Like
+// AudioOutputRing this is a single shared source compiled by both pods.
+//
+// NOTE: this iOS RunnerTests target is not yet wired into
+// example/ios/Runner.xcodeproj, so these cases are kept in lockstep with the
+// macOS suite (which CI runs) but are not executed until that target lands.
+class AudioInputRingTests: XCTestCase {
+
+  @discardableResult
+  private func write(_ ring: AudioInputRing, _ samples: [Float]) -> Int {
+    return samples.withUnsafeBufferPointer { ring.write($0) }
+  }
+
+  private func read(_ ring: AudioInputRing, _ maxCount: Int) -> [Float] {
+    var out = [Float](repeating: .nan, count: maxCount)
+    let read = out.withUnsafeMutableBufferPointer {
+      ring.read(into: $0.baseAddress!, maxCount: maxCount)
+    }
+    return Array(out.prefix(read))
+  }
+
+  func testWriteReadRoundTripReturnsOnlyAvailable() {
+    let ring = AudioInputRing(minimumCapacity: 2048)
+    XCTAssertEqual(write(ring, [1, 2, 3]), 3)
+    XCTAssertEqual(ring.availableToRead, 3)
+
+    XCTAssertEqual(read(ring, 5), [1, 2, 3], "read returns only the queued samples")
+    XCTAssertEqual(ring.availableToRead, 0)
+    XCTAssertEqual(read(ring, 5), [], "an empty ring reads back nothing")
+  }
+
+  func testWriteDropsNewestOnOverflow() {
+    let ring = AudioInputRing(minimumCapacity: 2048) // capacity == 2048
+    let fill = (0..<2048).map(Float.init)
+    XCTAssertEqual(write(ring, fill), 2048, "a full ring accepts exactly its capacity")
+
+    XCTAssertEqual(write(ring, [9, 9, 9]), 0, "writes to a full ring are dropped (drop-newest)")
+
+    let out = read(ring, 2048)
+    XCTAssertEqual(out.first, 0)
+    XCTAssertEqual(out.last, 2047, "the oldest samples survive; the newest overflow is dropped")
+  }
+
+  func testWriteAcceptsOnlyWhatFits() {
+    let ring = AudioInputRing(minimumCapacity: 2048)
+    XCTAssertEqual(write(ring, Array(repeating: 1.0, count: 2046)), 2046) // 2 free
+
+    XCTAssertEqual(write(ring, [7, 8, 9, 10]), 2, "only the 2 free slots are filled")
+  }
+
+  func testClearEmptiesInput() {
+    let ring = AudioInputRing(minimumCapacity: 2048)
+    XCTAssertEqual(write(ring, [1, 2, 3]), 3)
+
+    ring.clear()
+
+    XCTAssertEqual(ring.availableToRead, 0)
+    XCTAssertEqual(read(ring, 3), [], "clear() drops queued samples")
+
+    XCTAssertEqual(write(ring, [9, 9]), 2)
+    XCTAssertEqual(read(ring, 2), [9, 9], "fresh write after clear reads back cleanly")
+  }
+}
