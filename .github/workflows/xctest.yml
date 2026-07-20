@@ -25,6 +25,11 @@ concurrency:
   group: xctest-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default: both jobs only check out and build/test the code,
+# so a read-only GITHUB_TOKEN is all they need.
+permissions:
+  contents: read
+
 jobs:
   macos-xctest:
     name: macOS RunnerTests (xcodebuild test)
