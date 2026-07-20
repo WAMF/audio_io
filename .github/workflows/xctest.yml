@@ -25,6 +25,11 @@ concurrency:
   group: xctest-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default: both jobs only check out and build/test the code,
+# so a read-only GITHUB_TOKEN is all they need.
+permissions:
+  contents: read
+
 jobs:
   macos-xctest:
     name: macOS RunnerTests (xcodebuild test)
@@ -32,10 +37,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # No authenticated Git operations in this job; drop the persisted token.
+          persist-credentials: false
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
           cache: true
@@ -88,10 +96,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # No authenticated Git operations in this job; drop the persisted token.
+          persist-credentials: false
 
       - name: Set up Flutter
-        uses: subosito/flutter-action@v2
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
         with:
           channel: stable
           cache: true
