@@ -1,4 +1,4 @@
-## Unreleased
+## 0.6.0
 
 - `AudioIoConfig` now enforces its numeric field invariants in **all** build
   modes: `outputBufferDuration` must be a positive, finite number of seconds.
