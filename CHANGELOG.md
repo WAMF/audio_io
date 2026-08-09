@@ -1,3 +1,18 @@
+## Unreleased
+
+- Web: fixed a `flutter build web --release` compile failure introduced in
+  0.6.0. `_acquireSystemAudioStream` (behind `AudioIoInputSource.systemAudio`)
+  built the `getDisplayMedia` options as a raw `JSObject` and called it
+  through a local `MediaDevices.getDisplayMedia` extension, which only
+  applied while `package:web` had no native `getDisplayMedia` declaration
+  (true for `0.5.x`). Any app pinned or overridden to a newer `package:web`
+  (>=1.0.0, which declares `MediaDevices.getDisplayMedia` natively and
+  expects a typed `DisplayMediaStreamOptions`) failed to compile for web at
+  all, even without using `systemAudio` — the file is compiled
+  unconditionally on web. `audio_io` now depends on `web: ^1.0.0` directly
+  and builds a typed `web.DisplayMediaStreamOptions`; the local
+  `JSObject`-typed extension binding is removed (#50).
+
 ## 0.6.0
 
 - `AudioIoConfig` now enforces its numeric field invariants in **all** build

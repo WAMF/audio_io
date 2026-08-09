@@ -11,15 +11,6 @@ import 'audio_io_stub.dart';
 import 'output_buffer_math.dart';
 import 'output_ring.dart';
 
-/// `MediaDevices.getDisplayMedia` is not declared in `package:web` 0.5.x, so
-/// we bind it locally. It prompts the browser's screen/tab/window share
-/// picker (must be called from a user gesture) and resolves to a
-/// [web.MediaStream]. On Chromium the stream carries an audio track with the
-/// captured tab/system audio; Firefox and Safari resolve a video-only stream.
-extension MediaDevicesDisplayMediaExt on web.MediaDevices {
-  external JSPromise<web.MediaStream> getDisplayMedia([JSObject options]);
-}
-
 @JS('AudioContext')
 @staticInterop
 class AudioContext {
@@ -627,10 +618,11 @@ class AudioIoWeb extends AudioIoImpl {
       // playing out of the speakers — the right UX for a listening demo.
       // systemAudio: 'include' asks for full-system audio when the user
       // shares an entire screen (Chromium honours it; others ignore it).
-      final options = JSObject()
-        ..['audio'] = true.toJS
-        ..['video'] = true.toJS
-        ..['systemAudio'] = 'include'.toJS;
+      final options = web.DisplayMediaStreamOptions(
+        audio: true.toJS,
+        video: true.toJS,
+        systemAudio: 'include',
+      );
       stream = await web.window.navigator.mediaDevices
           .getDisplayMedia(options)
           .toDart;
