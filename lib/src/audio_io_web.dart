@@ -12,12 +12,15 @@ import 'output_buffer_math.dart';
 import 'output_ring.dart';
 
 /// `MediaDevices.getDisplayMedia` is not declared in `package:web` 0.5.x, so
-/// we bind it locally. It prompts the browser's screen/tab/window share
-/// picker (must be called from a user gesture) and resolves to a
+/// we bind it locally under a distinct Dart name. This prevents newer typed
+/// bindings from selecting their incompatible instance method. It prompts the
+/// browser's screen/tab/window share picker (must be called from a user
+/// gesture) and resolves to a
 /// [web.MediaStream]. On Chromium the stream carries an audio track with the
 /// captured tab/system audio; Firefox and Safari resolve a video-only stream.
 extension MediaDevicesDisplayMediaExt on web.MediaDevices {
-  external JSPromise<web.MediaStream> getDisplayMedia([JSObject options]);
+  @JS('getDisplayMedia')
+  external JSPromise<web.MediaStream> getDisplayMediaRaw([JSObject options]);
 }
 
 @JS('AudioContext')
@@ -632,7 +635,7 @@ class AudioIoWeb extends AudioIoImpl {
         ..['video'] = true.toJS
         ..['systemAudio'] = 'include'.toJS;
       stream = await web.window.navigator.mediaDevices
-          .getDisplayMedia(options)
+          .getDisplayMediaRaw(options)
           .toDart;
     } catch (e) {
       throw AudioIoException(
