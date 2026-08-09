@@ -1,4 +1,9 @@
-## Unreleased
+## 0.7.0
+
+**Breaking:** `web` moves from `^0.5.1` to `^1.0.0`, and the Dart SDK floor
+moves from `>=3.0.0` to `>=3.4.0`. An app pinned to `web: ^0.5.1` can no
+longer resolve this package; bump the app's `web` constraint alongside this
+upgrade.
 
 - Web: fixed a `flutter build web --release` compile failure introduced in
   0.6.0. `_acquireSystemAudioStream` (behind `AudioIoInputSource.systemAudio`)
