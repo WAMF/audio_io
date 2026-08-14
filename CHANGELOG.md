@@ -1,3 +1,11 @@
+## 0.6.1
+
+- Web: fixed system/tab audio capture breaking against newer `package:web`
+  versions — the plugin's local `getDisplayMedia` interop extension could
+  collide with the instance member declared by newer typed bindings, selecting
+  an incompatible method. The extension member is now bound explicitly via
+  `@JS('getDisplayMedia')` under a distinct Dart name (#50).
+
 ## 0.6.0
 
 - `AudioIoConfig` now enforces its numeric field invariants in **all** build
