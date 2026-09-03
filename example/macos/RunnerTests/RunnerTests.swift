@@ -157,3 +157,64 @@ class AudioInputRingTests: XCTestCase {
     XCTAssertEqual(read(ring, 2), [9, 9], "fresh write after clear reads back cleanly")
   }
 }
+
+// MARK: - SystemAudioTap helpers (#32)
+//
+// The Core Audio tap itself needs a signed app, a TCC grant, and a live output
+// device, none of which CI has. Its pure helpers — the channel downmix that
+// runs on the HAL IO thread and the aggregate-device description — are what
+// can drift silently, so they are pinned here.
+class SystemAudioTapHelperTests: XCTestCase {
+
+  func testInterleavedStereoDownmixAveragesChannels() throws {
+    guard #available(macOS 14.2, *) else { throw XCTSkip("Core Audio taps need macOS 14.2") }
+    let interleaved: [Float] = [1, 3, -2, 2, 0.5, 0.5]
+    var mono = [Float](repeating: .nan, count: 3)
+    interleaved.withUnsafeBufferPointer { input in
+      mono.withUnsafeMutableBufferPointer { output in
+        SystemAudioTap.downmix(
+          interleaved: input.baseAddress!, channels: 2, frames: 3,
+          into: output.baseAddress!)
+      }
+    }
+    XCTAssertEqual(mono, [2, 0, 0.5])
+  }
+
+  func testPlanarDownmixAveragesPlanes() throws {
+    guard #available(macOS 14.2, *) else { throw XCTSkip("Core Audio taps need macOS 14.2") }
+    let left: [Float] = [1, 1, 1]
+    let right: [Float] = [0, -1, 3]
+    var mono = [Float](repeating: .nan, count: 3)
+    left.withUnsafeBufferPointer { l in
+      right.withUnsafeBufferPointer { r in
+        mono.withUnsafeMutableBufferPointer { output in
+          SystemAudioTap.downmix(
+            planes: [l.baseAddress!, r.baseAddress!], frames: 3,
+            into: output.baseAddress!)
+        }
+      }
+    }
+    XCTAssertEqual(mono, [0.5, 0, 2])
+  }
+
+  func testAggregateDescriptionPairsOutputDeviceWithTap() throws {
+    guard #available(macOS 14.2, *) else { throw XCTSkip("Core Audio taps need macOS 14.2") }
+    let tapUUID = UUID()
+    let description = SystemAudioTap.aggregateDescription(
+      outputDeviceUID: "BuiltInSpeakerDevice", tapUUID: tapUUID)
+
+    XCTAssertEqual(description[kAudioAggregateDeviceMainSubDeviceKey] as? String, "BuiltInSpeakerDevice")
+    XCTAssertEqual(description[kAudioAggregateDeviceIsPrivateKey] as? Bool, true)
+    XCTAssertEqual(description[kAudioAggregateDeviceTapAutoStartKey] as? Bool, true)
+
+    let subDevices = description[kAudioAggregateDeviceSubDeviceListKey] as? [[String: Any]]
+    XCTAssertEqual(subDevices?.count, 1)
+    XCTAssertEqual(subDevices?.first?[kAudioSubDeviceUIDKey] as? String, "BuiltInSpeakerDevice")
+
+    let taps = description[kAudioAggregateDeviceTapListKey] as? [[String: Any]]
+    XCTAssertEqual(taps?.count, 1)
+    XCTAssertEqual(taps?.first?[kAudioSubTapUIDKey] as? String, tapUUID.uuidString)
+    XCTAssertEqual(taps?.first?[kAudioSubTapDriftCompensationKey] as? Bool, true)
+    XCTAssertNotNil(description[kAudioAggregateDeviceUIDKey] as? String)
+  }
+}

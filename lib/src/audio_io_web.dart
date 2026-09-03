@@ -378,8 +378,9 @@ class AudioIoWeb extends AudioIoImpl {
     // yields an audio track on Chromium, but that can't be detected until
     // the user has answered the share picker, so the "no audio track"
     // failure surfaces at start time as an [AudioIoException] with
-    // [AudioIoException.isSystemAudioUnsupported] rather than here.
-    return true;
+    // [AudioIoException.isSystemAudioUnsupported] rather than here. Summing
+    // the microphone into a display capture has no web implementation yet.
+    return source != AudioIoInputSource.microphoneAndSystemAudio;
   }
 
   @override

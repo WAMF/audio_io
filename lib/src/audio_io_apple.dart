@@ -1,7 +1,9 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/services.dart';
 
+import 'audio_io_input_source.dart';
 import 'audio_io_stub.dart';
 import 'audio_io_threading.dart';
 import 'ffi/audio_io_apple_ffi.dart';
@@ -16,6 +18,11 @@ import 'ffi/audio_io_apple_isolate.dart';
 /// deliver to the root isolate). See issue #27.
 class AudioIoApple extends AudioIoImpl {
   static const String _methodChannelName = 'com.wearemobilefirst.audio_io';
+
+  /// Key of the input source in the `start` call's argument map. The value is
+  /// the [AudioIoInputSource] name; the macOS plugin selects its capture
+  /// graph from it and the iOS plugin ignores it (microphone only).
+  static const String inputSourceArgument = 'inputSource';
   static const double _defaultFrameDuration = 0.003;
   static const Map<String, dynamic> _defaultFormat = <String, dynamic>{
     'input': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
@@ -26,6 +33,7 @@ class AudioIoApple extends AudioIoImpl {
 
   AudioIoAppleTransport? _transport;
   AudioIoThreading _threading = AudioIoThreading.mainIsolate;
+  AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
   double? _requestedFrameDuration;
   Map<String, dynamic> _format = _defaultFormat;
 
@@ -45,11 +53,28 @@ class AudioIoApple extends AudioIoImpl {
   }
 
   @override
+  void configureInputSource(AudioIoInputSource source) {
+    _inputSource = source;
+  }
+
+  @override
+  bool supportsInputSource(AudioIoInputSource source) {
+    // System audio rides on Core Audio process taps (macOS 14.2+, issue #32);
+    // iOS has no equivalent. A macOS host older than 14.2 is only detectable
+    // natively, so the plugin reports it from `start` as the same typed
+    // SYSTEM_AUDIO_UNSUPPORTED error.
+    return !source.includesSystemAudio || Platform.isMacOS;
+  }
+
+  @override
   Future<void> start() async {
     // Control plane: start the AVAudioEngine (permission check, session,
     // pipeline, ring allocation). A permission failure surfaces as a
     // PlatformException, which `AudioIo.start` maps to `AudioIoException`.
-    await _methods.invokeMethod<void>('start');
+    await _methods.invokeMethod<void>(
+      'start',
+      <String, dynamic>{inputSourceArgument: _inputSource.name},
+    );
 
     // The native engine and microphone capture are now live. If any of the
     // remaining setup throws — `getFormat` failing, or (the PR's top risk) the

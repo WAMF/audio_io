@@ -37,6 +37,10 @@ class AudioIoNative extends AudioIoImpl {
         // macOS system audio goes through the Core Audio tap method-channel
         // path (issue #32), not this FFI transport.
         return Platform.isWindows;
+      case AudioIoInputSource.microphoneAndSystemAudio:
+        // Summing the microphone into the loopback capture needs a mixer the
+        // miniaudio back end does not have; macOS-only for now.
+        return false;
     }
   }
 

@@ -120,9 +120,11 @@ class AudioIoConfig {
   /// Which source the input stream captures from. Defaults to
   /// [AudioIoInputSource.microphone]. [AudioIoInputSource.systemAudio]
   /// captures the machine's audio mix (Windows via WASAPI loopback, macOS
-  /// via Core Audio taps) and throws an [AudioIoException] with
+  /// via Core Audio taps, web via `getDisplayMedia`) and
+  /// [AudioIoInputSource.microphoneAndSystemAudio] sums the microphone into
+  /// it (macOS). Both throw an [AudioIoException] with
   /// [AudioIoException.isSystemAudioUnsupported] on platforms/backends that
-  /// cannot provide it.
+  /// cannot provide them.
   final AudioIoInputSource inputSource;
 
   /// Optional cap on how much audio the output ring may hold, in seconds of
@@ -214,7 +216,6 @@ class AudioIo {
   /// controller threw `Bad state: Stream has already been listened to` on the
   /// second startWith.
   Sink<Uint8List> get outputBytes => _pcm16.outputBytes;
-
 
   static final _fallbackController = StreamController<List<double>>();
 

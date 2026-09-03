@@ -1,3 +1,24 @@
+## 0.7.0
+
+- macOS: `AudioIoInputSource.systemAudio` is now implemented via Core Audio
+  process taps (macOS 14.2+). A private aggregate device pairs the default
+  output device with a mono global tap that excludes this process, rendered
+  into the AVAudioEngine input mixer, so the captured frames reach the same
+  `input` / `inputBytes` stream as the microphone and the app never hears its
+  own output. Older macOS throws `isSystemAudioUnsupported` from `startWith`;
+  a tap or aggregate-device failure throws the new
+  `AudioIoErrorCodes.systemAudioCaptureFailed` (`isSystemAudioCaptureFailed`).
+  Apps must add `NSAudioCaptureUsageDescription` to their Info.plist (#32).
+- New `AudioIoInputSource.microphoneAndSystemAudio` sums the microphone and
+  the system audio mix into the one mono input stream (macOS only — the
+  AVAudioEngine mixer does the summing; every other back end reports it
+  unsupported). `AudioIoInputSource` gains `includesMicrophone` /
+  `includesSystemAudio` helpers.
+- macOS: the plugin now requests microphone access itself when it is not yet
+  determined (`permission_handler` has no macOS implementation), instead of
+  failing `start` with `MICROPHONE_PERMISSION_DENIED`. A system-audio-only
+  session never touches the microphone input unit.
+
 ## 0.6.1
 
 - Web: fixed system/tab audio capture breaking against newer `package:web`

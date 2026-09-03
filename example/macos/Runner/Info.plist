@@ -30,5 +30,7 @@
 	<string>NSApplication</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app needs access to the microphone for audio input processing.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>This app captures the audio playing on this Mac to demonstrate system-audio input.</string>
 </dict>
 </plist>
