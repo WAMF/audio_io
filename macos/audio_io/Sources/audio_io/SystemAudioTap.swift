@@ -16,16 +16,18 @@ public struct SystemAudioCaptureFailure: Error, CustomStringConvertible {
 
 /// Captures the machine's audio mix — every process except this one — through
 /// a Core Audio process tap (macOS 14.2+) and queues it as mono Float32 frames
-/// in an `AudioInputRing`, which `AudioIoPlugin` renders into its input graph
-/// through an `AVAudioSourceNode`.
+/// in an `AudioInputRing`. For a system-audio-only session `AudioIoPlugin`
+/// hands that ring to Dart as the input ring; for microphone plus system audio
+/// it renders the ring into its mixer through an `AVAudioSourceNode`.
 ///
 /// Topology, per Apple's guidance: a private aggregate device whose main
 /// sub-device is the default output device (it supplies the clock) with the
 /// tap attached as a sub-tap. A tap-only aggregate produces no samples. The
 /// tap is created mono and global, excluding this process, so audio the app
-/// itself plays (TTS through the output stream) never feeds back into the
-/// capture. `muteBehavior` stays `.unmuted`: the captured audio keeps playing
-/// out of the speakers.
+/// itself plays (TTS through the output stream) does not feed back into the
+/// capture; if that exclusion cannot be built, `init` throws rather than
+/// capture everything. `muteBehavior` stays `.unmuted`: the captured audio
+/// keeps playing out of the speakers.
 @available(macOS 14.2, *)
 public final class SystemAudioTap {
     enum Constants {
@@ -55,6 +57,10 @@ public final class SystemAudioTap {
     private var ioProcID: AudioDeviceIOProcID?
     private var monoScratch: UnsafeMutablePointer<Float>
     private var monoScratchCapacity: Int
+    /// Fixed table of plane pointers for the planar downmix, sized to the
+    /// tap's channel count in `init` so the IO proc never allocates.
+    private let planeTable: UnsafeMutablePointer<UnsafePointer<Float>>
+    private let planeTableCapacity: Int
     private(set) var isRunning = false
 
     /// Creates the tap and its aggregate device. Nothing is captured until
@@ -65,7 +71,7 @@ public final class SystemAudioTap {
         let subDeviceInputStreams = Self.inputStreamCount(of: outputDevice)
 
         let description = CATapDescription(
-            monoGlobalTapButExcludeProcesses: Self.ownProcessObjects())
+            monoGlobalTapButExcludeProcesses: [try Self.ownProcessObject()])
         description.name = Constants.tapName
         description.isPrivate = true
         description.muteBehavior = .unmuted
@@ -107,6 +113,9 @@ public final class SystemAudioTap {
         self.monoScratchCapacity = Constants.minimumScratchFrames
         self.monoScratch = UnsafeMutablePointer<Float>.allocate(
             capacity: Constants.minimumScratchFrames)
+        self.planeTableCapacity = max(Int(format.mChannelsPerFrame), 1)
+        self.planeTable = UnsafeMutablePointer<UnsafePointer<Float>>.allocate(
+            capacity: planeTableCapacity)
     }
 
     deinit {
@@ -114,12 +123,14 @@ public final class SystemAudioTap {
         AudioHardwareDestroyAggregateDevice(aggregateID)
         AudioHardwareDestroyProcessTap(tapID)
         monoScratch.deallocate()
+        planeTable.deallocate()
     }
 
     /// Installs the IO proc on the aggregate device and starts it. Frames
     /// then arrive on `ring` from the HAL's IO thread.
     public func start() throws {
         if isRunning { return }
+        ensureScratch(Self.bufferFrameSize(of: aggregateID))
         var created: AudioDeviceIOProcID?
         try Self.check(
             AudioDeviceCreateIOProcIDWithBlock(&created, aggregateID, queue) {
@@ -159,7 +170,10 @@ public final class SystemAudioTap {
     /// Runs on the HAL IO thread: picks the tap's buffer(s) out of the
     /// aggregate's input list, folds any channel layout down to mono, and
     /// writes into the lock-protected ring. No allocation on the steady-state
-    /// path: the mono scratch grows only if a callback exceeds its capacity.
+    /// path: the plane table is fixed at `init`, and the mono scratch is sized
+    /// to the device's buffer frame size in `start()`; it grows only if a
+    /// callback ever exceeds that, which a device with a fixed buffer size
+    /// does not do.
     private func capture(_ input: UnsafePointer<AudioBufferList>) {
         let buffers = UnsafeMutableAudioBufferListPointer(
             UnsafeMutablePointer(mutating: input))
@@ -181,17 +195,19 @@ public final class SystemAudioTap {
         if nonInterleaved {
             // One buffer per channel plane, starting at the tap's index.
             let planeCount = min(
-                Int(tapFormat.mChannelsPerFrame), buffers.count - tapBufferIndex)
-            var planes: [UnsafePointer<Float>] = []
-            planes.reserveCapacity(planeCount)
+                planeTableCapacity, buffers.count - tapBufferIndex)
+            var planesFound = 0
             for plane in 0..<planeCount {
                 if let planeData = buffers[tapBufferIndex + plane].mData?
                     .assumingMemoryBound(to: Float.self)
                 {
-                    planes.append(UnsafePointer(planeData))
+                    planeTable[planesFound] = UnsafePointer(planeData)
+                    planesFound += 1
                 }
             }
-            Self.downmix(planes: planes, frames: frames, into: monoScratch)
+            Self.downmix(
+                planes: UnsafePointer(planeTable), planeCount: planesFound,
+                frames: frames, into: monoScratch)
         } else {
             Self.downmix(
                 interleaved: UnsafePointer(data), channels: channels, frames: frames,
@@ -228,16 +244,27 @@ public final class SystemAudioTap {
 
     /// Averages one sample per plane into one mono sample per frame.
     public static func downmix(
-        planes: [UnsafePointer<Float>], frames: Int, into out: UnsafeMutablePointer<Float>
+        planes: UnsafePointer<UnsafePointer<Float>>, planeCount: Int, frames: Int,
+        into out: UnsafeMutablePointer<Float>
     ) {
-        guard !planes.isEmpty else { return }
-        let gain = 1.0 / Float(planes.count)
+        guard planeCount > 0 else { return }
+        let gain = 1.0 / Float(planeCount)
         for frame in 0..<frames {
             var sum: Float = 0
-            for plane in planes {
-                sum += plane[frame]
+            for plane in 0..<planeCount {
+                sum += planes[plane][frame]
             }
             out[frame] = sum * gain
+        }
+    }
+
+    /// Array convenience over the pointer form, for callers off the IO thread.
+    public static func downmix(
+        planes: [UnsafePointer<Float>], frames: Int, into out: UnsafeMutablePointer<Float>
+    ) {
+        planes.withUnsafeBufferPointer { table in
+            guard let base = table.baseAddress else { return }
+            downmix(planes: base, planeCount: table.count, frames: frames, into: out)
         }
     }
 
@@ -311,6 +338,19 @@ public final class SystemAudioTap {
         return uid as String
     }
 
+    /// The device's IO buffer size in frames, or the scratch minimum when it
+    /// cannot be read.
+    private static func bufferFrameSize(of device: AudioObjectID) -> Int {
+        var address = globalAddress(kAudioDevicePropertyBufferFrameSize)
+        var frames: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &frames) == noErr
+        else {
+            return Constants.minimumScratchFrames
+        }
+        return max(Int(frames), Constants.minimumScratchFrames)
+    }
+
     private static func inputStreamCount(of device: AudioObjectID) -> Int {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreams,
@@ -325,10 +365,10 @@ public final class SystemAudioTap {
 
     /// This process's HAL object, for the tap's exclusion list. The HAL only
     /// registers a process once it has touched Core Audio, which the property
-    /// reads above guarantee by the time this runs. If the translation still
-    /// fails the tap captures everything and the app will hear its own
-    /// output — logged rather than fatal, since capture still works.
-    private static func ownProcessObjects() -> [AudioObjectID] {
+    /// reads in `init` do before this runs. An empty exclusion list would
+    /// exclude nothing and the app would hear its own output, so a failed
+    /// translation fails the start (`SYSTEM_AUDIO_CAPTURE_FAILED`) instead.
+    private static func ownProcessObject() throws -> AudioObjectID {
         var pid = ProcessInfo.processInfo.processIdentifier
         var address = globalAddress(kAudioHardwarePropertyTranslatePIDToProcessObject)
         var object = AudioObjectID(kAudioObjectUnknown)
@@ -338,13 +378,13 @@ public final class SystemAudioTap {
                 AudioObjectID(kAudioObjectSystemObject), &address,
                 UInt32(MemoryLayout<pid_t>.size), pidPointer, &size, &object)
         }
-        guard status == noErr, object != kAudioObjectUnknown else {
-            NSLog(
-                "audio_io: could not resolve own process object (OSStatus %d); "
-                    + "system audio capture will include this app's output", status)
-            return []
+        try check(status, "kAudioHardwarePropertyTranslatePIDToProcessObject")
+        guard object != kAudioObjectUnknown else {
+            throw SystemAudioCaptureFailure(
+                operation: "kAudioHardwarePropertyTranslatePIDToProcessObject (no process object)",
+                status: OSStatus(kAudioHardwareBadObjectError))
         }
-        return [object]
+        return object
     }
 
     private static func readFormat(of tap: AudioObjectID) throws
