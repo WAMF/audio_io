@@ -37,6 +37,25 @@ enum AudioIoError {
 
 enum Channels: String {
     case methodChannelName = "com.wearemobilefirst.audio_io"
+    /// Failures of a running session, pushed to Dart as `FlutterError`s.
+    case sessionEventChannelName = "com.wearemobilefirst.audio_io/session"
+}
+
+/// Holds the sink of the session event channel while Dart listens.
+final class SessionEventStreamHandler: NSObject, FlutterStreamHandler {
+    private(set) var sink: FlutterEventSink?
+
+    func onListen(withArguments _: Any?, eventSink events: @escaping FlutterEventSink)
+        -> FlutterError?
+    {
+        sink = events
+        return nil
+    }
+
+    func onCancel(withArguments _: Any?) -> FlutterError? {
+        sink = nil
+        return nil
+    }
 }
 
 enum AudioDataTypes: String {
@@ -95,6 +114,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     static fileprivate(set) weak var shared: AudioIoPlugin?
 
     let engine = AVAudioEngine()
+    private let sessionEvents = SessionEventStreamHandler()
     /// Sums every capture source (microphone input node, system-audio tap
     /// source node) into the single mono stream the sink node drains.
     var inputConverter = AVAudioMixerNode()
@@ -168,6 +188,10 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger)
         let instance = AudioIoPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
+        FlutterEventChannel(
+            name: Channels.sessionEventChannelName.rawValue,
+            binaryMessenger: registrar.messenger
+        ).setStreamHandler(instance.sessionEvents)
         AudioIoPlugin.shared = instance
 
         NotificationCenter.default.addObserver(
@@ -279,17 +303,23 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         do {
             try startInternal()
             result(nil)
-        } catch let failure as SystemAudioCaptureFailure {
-            result(FlutterError(
+        } catch {
+            result(Self.flutterError(for: error))
+        }
+    }
+
+    private static func flutterError(for error: Error) -> FlutterError {
+        if let failure = error as? SystemAudioCaptureFailure {
+            return FlutterError(
                 code: AudioIoError.systemAudioCaptureFailedCode,
                 message: failure.description,
-                details: nil))
-        } catch let error as NSError {
-            result(FlutterError(
-                code: error.domain,
-                message: error.localizedDescription,
-                details: nil))
+                details: nil)
         }
+        let nsError = error as NSError
+        return FlutterError(
+            code: nsError.domain,
+            message: nsError.localizedDescription,
+            details: nil)
     }
 
     private func outputRingCapacity() -> Int {
@@ -317,8 +347,10 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         try setupPipelineIfNeeded()
 
         // Sized to the same jitter budget as the output ring, at the capture
-        // rate the pipeline negotiated in setupPipelineIfNeeded().
-        let newInputRing = AudioInputRing(minimumCapacity: captureRingCapacity())
+        // rate the pipeline negotiated in setupPipelineIfNeeded(). A
+        // system-audio-only session drains the tap's own ring instead.
+        let newInputRing =
+            directTapRing() ?? AudioInputRing(minimumCapacity: captureRingCapacity())
 
         // Publish both rings atomically under ringLock so a concurrent FFI
         // export (Dart poll/write isolate) snapshots either the whole old or
@@ -335,7 +367,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
 
         try engine.start()
         // The tap only starts once the engine renders, so its ring never fills
-        // (and adds latency) while no source node is draining it.
+        // (and adds latency) while nothing is draining it.
         if #available(macOS 14.2, *), let tap = systemAudioTap as? SystemAudioTap {
             do {
                 try tap.start()
@@ -364,27 +396,67 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         return buffer
     }
 
-    /// Builds the capture graph for `_inputSource`:
+    /// A system-audio-only session has no engine input chain: the tap writes
+    /// straight into the plugin's input ring (see `setupPipelineIfNeeded`).
+    private var tapFeedsInputRingDirectly: Bool { _inputSource == .systemAudio }
+
+    /// The tap's ring when the tap feeds the input ring directly, else nil.
+    private func directTapRing() -> AudioInputRing? {
+        guard tapFeedsInputRingDirectly, #available(macOS 14.2, *),
+            let tap = systemAudioTap as? SystemAudioTap
+        else { return nil }
+        return tap.ring
+    }
+
+    /// Builds the capture graph for `_inputSource`.
+    ///
+    /// Microphone, and microphone plus system audio (the mixer sums the two):
     ///
     ///     inputNode ──┐
     ///                 ├─▶ inputConverter (mixer) ─▶ sinkNode ─▶ inputRing
     ///     tapSource ──┘
     ///
-    /// The microphone leg is only touched when the source includes it —
-    /// `engine.inputNode` instantiates the input unit, and a system-audio-only
-    /// session must not require microphone access. The processing rate follows
-    /// the microphone when present (the tap is resampled by the mixer), else
-    /// the tap's own rate.
+    /// System audio only:
+    ///
+    ///     SystemAudioTap (HAL IO proc) ─▶ inputRing
+    ///
+    /// `AVAudioSinkNode` is an input-chain terminal: the engine renders it from
+    /// the input unit's I/O cycle, which exists only once `engine.inputNode`
+    /// is in the graph. A system-audio-only session must not instantiate the
+    /// input unit (that is what keeps it free of the microphone grant), so it
+    /// has no input cycle and nothing would ever pull a sink node — the tap
+    /// would fill its ring and `input` would deliver no frames at all. The tap
+    /// therefore writes into the plugin's input ring itself, which the Dart
+    /// FFI poll drains exactly as it drains the microphone ring. The
+    /// processing rate follows the microphone when present (the tap is
+    /// resampled by the mixer), else the tap's own rate.
     public func setupPipelineIfNeeded() throws {
         if _isPipelineSetup { return }
+        do {
+            try buildPipeline()
+        } catch {
+            // Nothing of a half-built graph may survive: a retry after a
+            // recoverable tap failure (no output device, grant missing) must
+            // start from a fresh mixer, or the microphone lands on a second
+            // bus and is summed with itself.
+            detachPipeline()
+            throw error
+        }
+    }
+
+    private func buildPipeline() throws {
+        // The tap is the only step that can throw, so it is built before the
+        // graph is touched.
+        if _inputSource.usesSystemAudio, #available(macOS 14.2, *) {
+            systemAudioTap = try SystemAudioTap(ringCapacity: captureRingCapacity())
+        }
 
         let output = engine.mainMixerNode
-        inputConverter.outputVolume = 1.0
-        engine.attach(inputConverter)
-        engine.attach(sinkNode)
-
         var captureRate: Double?
         if _inputSource.usesMicrophone {
+            inputConverter.outputVolume = 1.0
+            engine.attach(inputConverter)
+            engine.attach(sinkNode)
             let input = engine.inputNode
             let inputFormat = input.inputFormat(forBus: 0)
             engine.connect(
@@ -393,37 +465,45 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
                 format: inputFormat)
             captureRate = inputFormat.sampleRate
         }
-        if _inputSource.usesSystemAudio {
-            if #available(macOS 14.2, *) {
-                let tap = try SystemAudioTap(ringCapacity: captureRingCapacity())
+        if #available(macOS 14.2, *), let tap = systemAudioTap as? SystemAudioTap {
+            captureRate = captureRate ?? tap.sampleRate
+            if !tapFeedsInputRingDirectly {
                 let node = createTapSourceNode(tap: tap)
                 engine.attach(node)
                 engine.connect(
                     node, to: inputConverter,
                     fromBus: 0, toBus: inputConverter.nextAvailableInputBus,
                     format: node.outputFormat(forBus: 0))
-                systemAudioTap = tap
                 tapSourceNode = node
-                captureRate = captureRate ?? tap.sampleRate
             }
         }
         _sampleRate = captureRate ?? _Constants.preferedSampleRate
 
         let sourceNode = createSourceNode()
-        let processingformat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1,
-            interleaved: false)
         engine.attach(sourceNode)
-        engine.connect(inputConverter, to: sinkNode, format: processingformat)
+        if _inputSource.usesMicrophone {
+            let processingformat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1,
+                interleaved: false)
+            engine.connect(inputConverter, to: sinkNode, format: processingformat)
+        }
         engine.connect(sourceNode, to: output, format: nil)
         self.sourceNode = sourceNode
         _isPipelineSetup = true
     }
 
     /// Renders the tap's mono Float32 ring into the mixer at the tap's sample
-    /// rate. A shortfall is zero-filled: the HAL IO proc and the engine render
-    /// thread run on the same output-device clock, so underruns only happen at
-    /// start-up or across a device change.
+    /// rate, for `microphoneAndSystemAudio` only. The ring is written by the
+    /// aggregate device's IO proc on the default *output* device's clock and
+    /// drained here by the engine's input chain on the default *input*
+    /// device's clock. When both are the same physical device (built-in
+    /// speakers and microphone) the two run in lock-step and a shortfall,
+    /// which is zero-filled, only happens at start-up or across a device
+    /// change. With separate devices (a USB or Bluetooth microphone with the
+    /// internal speakers) the rates differ slightly, so the ring drifts to a
+    /// zero-fill or a drop-newest every few seconds — an audible click in the
+    /// mixed stream. That is a documented limit of the mixed source; the ring
+    /// is not rate-matched. A system-audio-only session has no second clock.
     @available(macOS 14.2, *)
     private func createTapSourceNode(tap: SystemAudioTap) -> AVAudioSourceNode {
         let format = AVAudioFormat(
@@ -444,14 +524,21 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         }
     }
 
+    private func detachIfAttached(_ node: AVAudioNode) {
+        if engine.attachedNodes.contains(node) {
+            engine.detach(node)
+        }
+    }
+
     public func detachPipeline() {
-        engine.detach(inputConverter)
-        engine.detach(sinkNode)
+        detachIfAttached(inputConverter)
+        detachIfAttached(sinkNode)
         if let sourceNode = sourceNode {
-            engine.detach(sourceNode)
+            detachIfAttached(sourceNode)
+            self.sourceNode = nil
         }
         if let tapSourceNode = tapSourceNode {
-            engine.detach(tapSourceNode)
+            detachIfAttached(tapSourceNode)
             self.tapSourceNode = nil
         }
         if #available(macOS 14.2, *), let tap = systemAudioTap as? SystemAudioTap {
@@ -468,13 +555,24 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         resetAudio()
     }
 
+    /// Rebuilds the pipeline after a configuration change. A rebuild can fail
+    /// for every reason `start` can (the tap is recreated against the new
+    /// default output device), so a failure ends the session and is pushed to
+    /// Dart: a later `start()` is then a clean rebuild instead of a no-op on
+    /// a session that only claims to run.
     public func resetAudio() {
         if _isRunning && !_resetting {
             _resetting = true
             engine.stop()
             detachPipeline()
             DispatchQueue.main.async {
-                try? self.startInternal()
+                do {
+                    try self.startInternal()
+                } catch {
+                    self._isRunning = false
+                    self.detachPipeline()
+                    self.sessionEvents.sink?(Self.flutterError(for: error))
+                }
                 self._resetting = false
             }
         }
