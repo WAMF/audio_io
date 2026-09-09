@@ -290,9 +290,13 @@ System audio is captured through a
 [Core Audio process tap](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps)
 (macOS 14.2+): a private aggregate device pairs the default output device
 with a global tap that excludes this process, so audio the app plays through
-the output stream is never fed back into the input. The tap is rendered into
-the plugin's AVAudioEngine mixer alongside the microphone, which is how the
-mixed mode works, and the captured audio keeps playing out of the speakers.
+the output stream is not fed back into the input. If the plugin cannot
+resolve its own process for that exclusion list, `startWith` throws
+`isSystemAudioCaptureFailed` instead of capturing everything. For
+`systemAudio` the tap writes straight into the input ring the Dart side
+drains; for `microphoneAndSystemAudio` it is rendered into the plugin's
+AVAudioEngine mixer alongside the microphone. The captured audio keeps
+playing out of the speakers.
 
 - **Info.plist:** add `NSAudioCaptureUsageDescription` — the first tap
   triggers a **System Audio Recording** permission prompt (its own TCC
@@ -302,8 +306,14 @@ mixed mode works, and the captured audio keeps playing out of the speakers.
   category with different copy.
 - **Permission is prompted, not pre-checked:** there is no public API to read
   the audio-capture grant. If the user denies it the tap produces silence
-  rather than an error; `tccutil reset SystemAudioCaptureRequests <bundle-id>`
-  resets it while testing. The prompt only fires for a signed app.
+  rather than an error; `tccutil reset AudioCapture <bundle-id>` resets it
+  while testing. The prompt only fires for a signed app, and TCC attributes
+  the request to the *responsible* process: an app launched by the `flutter`
+  tool from a terminal is attributed to that terminal, which has no
+  `NSAudioCaptureUsageDescription`, so the request is denied silently. Launch
+  the app from Finder or `open` to be prompted as the app itself, or grant
+  the terminal *System Audio Recording Only* in System Settings > Privacy &
+  Security.
 - **Microphone:** `permission_handler` has no macOS implementation, so the
   plugin requests microphone access itself (`NSMicrophoneUsageDescription`)
   when a source that includes the microphone starts and access is not yet
@@ -315,7 +325,22 @@ mixed mode works, and the captured audio keeps playing out of the speakers.
 - **Device changes:** the aggregate follows the output device that was the
   default when capture started; the engine's configuration-change reset
   rebuilds it, and every `stop` tears it down so the next start binds to the
-  current default.
+  current default. If the rebuild fails, the session ends and the failure is
+  reported on `AudioIo.sessionErrors`; the next `start` rebuilds from
+  scratch.
+- **Mixed source and two clocks:** for `microphoneAndSystemAudio` the tap
+  ring is written on the output device's clock and drained on the input
+  device's clock, and it is not rate-matched. Built-in speakers with the
+  built-in microphone share one clock and are fine; a USB or Bluetooth
+  microphone with the internal speakers drifts, and the ring zero-fills or
+  drops a buffer every few seconds — an audible click in the mixed stream.
+- **What is tested:** the XCTest target (`example/macos/RunnerTests`)
+  covers the tap's pure helpers only — the interleaved and planar downmix
+  and the aggregate-device description. The capture itself, and the
+  own-process exclusion, are asserted by
+  `example/integration_test/system_audio_test.dart` on a macOS host with
+  the grant: another process's speech is heard, then the app's own tone is
+  not, in the same session.
 
 **Own-process exclusion.** On Windows the host process is excluded from the
 loopback capture (`wasapi.loopbackProcessID` + `loopbackProcessExclude`), so an

@@ -2,18 +2,33 @@
 
 - macOS: `AudioIoInputSource.systemAudio` is now implemented via Core Audio
   process taps (macOS 14.2+). A private aggregate device pairs the default
-  output device with a mono global tap that excludes this process, rendered
-  into the AVAudioEngine input mixer, so the captured frames reach the same
-  `input` / `inputBytes` stream as the microphone and the app never hears its
-  own output. Older macOS throws `isSystemAudioUnsupported` from `startWith`;
-  a tap or aggregate-device failure throws the new
-  `AudioIoErrorCodes.systemAudioCaptureFailed` (`isSystemAudioCaptureFailed`).
-  Apps must add `NSAudioCaptureUsageDescription` to their Info.plist (#32).
+  output device with a mono global tap that excludes this process. The tap
+  writes straight into the plugin's input ring, so the captured frames reach
+  the same `input` / `inputBytes` stream as the microphone. The exclusion is
+  a precondition of the start: when the process cannot be resolved for the
+  exclusion list, `startWith` throws `isSystemAudioCaptureFailed` rather
+  than capture the app's own output. Older macOS throws
+  `isSystemAudioUnsupported` from `startWith`; a tap or aggregate-device
+  failure throws the new `AudioIoErrorCodes.systemAudioCaptureFailed`
+  (`isSystemAudioCaptureFailed`). Apps must add
+  `NSAudioCaptureUsageDescription` to their Info.plist (#32).
 - New `AudioIoInputSource.microphoneAndSystemAudio` sums the microphone and
   the system audio mix into the one mono input stream (macOS only — the
   AVAudioEngine mixer does the summing; every other back end reports it
-  unsupported). `AudioIoInputSource` gains `includesMicrophone` /
-  `includesSystemAudio` helpers.
+  unsupported). Known limit: the tap ring is written on the output device's
+  clock and drained on the input device's clock, and it is not rate-matched,
+  so with a microphone that is a different physical device from the speakers
+  the mixed stream carries a periodic click. `AudioIoInputSource` gains
+  `includesMicrophone` / `includesSystemAudio` helpers.
+- New `AudioIo.sessionErrors` stream: failures the engine reports after
+  `start` returned. On macOS a system-audio session whose tap cannot be
+  rebuilt after an audio device change ends and reports the failure here with
+  the same codes `startWith` throws; other platforms never emit.
+- Tests: the XCTest target covers the tap's pure helpers (interleaved and
+  planar downmix, aggregate-device description); the example integration test
+  (`flutter test integration_test -d macos`, needs a host with the System
+  Audio Recording grant) asserts that a system-audio session hears another
+  process and then, in the same session, does not hear its own output.
 - macOS: the plugin now requests microphone access itself when it is not yet
   determined (`permission_handler` has no macOS implementation), instead of
   failing `start` with `MICROPHONE_PERMISSION_DENIED`. A system-audio-only
