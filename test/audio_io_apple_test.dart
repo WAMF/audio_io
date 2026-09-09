@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:audio_io/audio_io.dart';
 import 'package:audio_io/src/audio_io_apple.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -156,6 +157,47 @@ void main() {
           ),
         ),
       );
+    });
+  });
+
+  group('AudioIo session errors', () {
+    const sessionChannel = EventChannel('com.wearemobilefirst.audio_io/session');
+
+    tearDown(() {
+      debugDefaultTargetPlatformOverride = null;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockStreamHandler(sessionChannel, null);
+    });
+
+    test('a failed macOS rebuild arrives as a typed AudioIoException',
+        () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockStreamHandler(
+        sessionChannel,
+        MockStreamHandler.inline(
+          onListen: (arguments, events) {
+            events.error(
+              code: 'SYSTEM_AUDIO_CAPTURE_FAILED',
+              message:
+                  'AudioHardwareCreateAggregateDevice failed (OSStatus -50)',
+            );
+          },
+        ),
+      );
+      final audio = AudioIo.withImpl(AudioIoApple());
+
+      final error = await audio.sessionErrors.first;
+
+      expect(error.isSystemAudioCaptureFailed, isTrue);
+      expect(error.message, contains('AudioHardwareCreateAggregateDevice'));
+    });
+
+    test('is silent on iOS, which has no session event channel', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      final audio = AudioIo.withImpl(AudioIoApple());
+
+      expect(await audio.sessionErrors.isEmpty, isTrue);
     });
   });
 }
