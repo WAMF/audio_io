@@ -148,21 +148,33 @@ class _MyAppState extends State<MyApp> {
       final lstring = latency.toStringAsPrecision(2);
       await AudioIo.instance.getFormat();
       setState(() {
-        _status = inputSource == AudioIoInputSource.systemAudio
-            ? 'Started — pick a tab to share ($lstring ms)'
-            : 'Started ($lstring ms)';
+        _status = _startedStatus(inputSource, lstring);
       });
     } on AudioIoException catch (e) {
       setState(() {
         _status = e.isSystemAudioUnsupported
             ? 'System audio not available: ${e.message}'
-            : 'Failed: ${e.message}';
+            : e.isSystemAudioCaptureFailed
+                ? 'System audio capture failed: ${e.message}'
+                : 'Failed: ${e.message}';
       });
     } on PlatformException {
       setState(() {
         _status = 'Failed';
       });
     }
+  }
+
+  String _startedStatus(AudioIoInputSource inputSource, String latency) {
+    if (inputSource == AudioIoInputSource.microphoneAndSystemAudio) {
+      return 'Started — mic + system audio ($latency ms)';
+    }
+    if (inputSource == AudioIoInputSource.systemAudio) {
+      return kIsWeb
+          ? 'Started — pick a tab to share ($latency ms)'
+          : 'Started — listening to system audio ($latency ms)';
+    }
+    return 'Started ($latency ms)';
   }
 
   void stopAudio() async {
@@ -240,6 +252,11 @@ class _MyAppState extends State<MyApp> {
           value: AudioIoInputSource.systemAudio,
           label: Text('System / tab audio'),
           icon: Icon(Icons.desktop_windows),
+        ),
+        ButtonSegment(
+          value: AudioIoInputSource.microphoneAndSystemAudio,
+          label: Text('Mic + system'),
+          icon: Icon(Icons.headset_mic),
         ),
       ],
       selected: {_inputSource},

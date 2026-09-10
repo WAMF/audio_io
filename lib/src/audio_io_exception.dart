@@ -16,6 +16,12 @@ class AudioIoErrorCodes {
   /// WASAPI loopback does not exist) or on a non-Chromium browser (where
   /// `getDisplayMedia` returns no audio track).
   static const systemAudioUnsupported = 'SYSTEM_AUDIO_UNSUPPORTED';
+
+  /// The platform supports system audio but setting up the capture failed —
+  /// on macOS, creating the Core Audio process tap or its aggregate device
+  /// returned an error. The message carries the failing operation and
+  /// `OSStatus`.
+  static const systemAudioCaptureFailed = 'SYSTEM_AUDIO_CAPTURE_FAILED';
 }
 
 /// Error raised by `AudioIo` for typed, recoverable audio failures.
@@ -36,6 +42,11 @@ class AudioIoException implements Exception {
   /// platform / backend cannot provide.
   bool get isSystemAudioUnsupported =>
       code == AudioIoErrorCodes.systemAudioUnsupported;
+
+  /// True when the platform supports system audio but the native capture
+  /// could not be set up (see [AudioIoErrorCodes.systemAudioCaptureFailed]).
+  bool get isSystemAudioCaptureFailed =>
+      code == AudioIoErrorCodes.systemAudioCaptureFailed;
 
   @override
   String toString() => 'AudioIoException($code): $message';

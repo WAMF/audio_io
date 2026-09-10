@@ -30,10 +30,32 @@ enum AudioIoError {
     static let permissionDeniedMessage = "Microphone permission not granted. This plugin requires microphone access to function. Please request microphone permission using a package like permission_handler before calling start()."
     static let engineStartCode = "ENGINE_START_ERROR"
     static let engineStartMessage = "Failed to start audio engine"
+    static let systemAudioUnsupportedCode = "SYSTEM_AUDIO_UNSUPPORTED"
+    static let systemAudioUnsupportedMessage = "System audio capture needs macOS 14.2 or newer (Core Audio process taps)."
+    static let systemAudioCaptureFailedCode = "SYSTEM_AUDIO_CAPTURE_FAILED"
 }
 
 enum Channels: String {
     case methodChannelName = "com.wearemobilefirst.audio_io"
+    /// Failures of a running session, pushed to Dart as `FlutterError`s.
+    case sessionEventChannelName = "com.wearemobilefirst.audio_io/session"
+}
+
+/// Holds the sink of the session event channel while Dart listens.
+final class SessionEventStreamHandler: NSObject, FlutterStreamHandler {
+    private(set) var sink: FlutterEventSink?
+
+    func onListen(withArguments _: Any?, eventSink events: @escaping FlutterEventSink)
+        -> FlutterError?
+    {
+        sink = events
+        return nil
+    }
+
+    func onCancel(withArguments _: Any?) -> FlutterError? {
+        sink = nil
+        return nil
+    }
 }
 
 enum AudioDataTypes: String {
@@ -51,6 +73,38 @@ enum _AudioFormat {
     static let output = "output"
 }
 
+/// Mirrors `AudioIoInputSource` on the Dart side; carried by name in the
+/// `start` call's arguments.
+enum InputSource: String {
+    case microphone
+    case systemAudio
+    case microphoneAndSystemAudio
+
+    static let argumentKey = "inputSource"
+
+    var usesMicrophone: Bool { self != .systemAudio }
+    var usesSystemAudio: Bool { self != .microphone }
+
+    static func from(_ arguments: Any?) -> InputSource {
+        guard let map = arguments as? [String: Any],
+            let name = map[argumentKey] as? String,
+            let source = InputSource(rawValue: name)
+        else {
+            return .microphone
+        }
+        return source
+    }
+}
+
+enum SystemAudioSupport {
+    static var isAvailable: Bool {
+        if #available(macOS 14.2, *) {
+            return true
+        }
+        return false
+    }
+}
+
 public class AudioIoPlugin: NSObject, FlutterPlugin {
     /// Set once in `register(with:)`. The `@_cdecl` FFI data-plane exports
     /// (see the free functions at the bottom of this file) resolve the live
@@ -60,10 +114,14 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     static fileprivate(set) weak var shared: AudioIoPlugin?
 
     let engine = AVAudioEngine()
+    private let sessionEvents = SessionEventStreamHandler()
+    /// Sums every capture source (microphone input node, system-audio tap
+    /// source node) into the single mono stream the sink node drains.
     var inputConverter = AVAudioMixerNode()
     var _frameDuration = _Constants.defaultFrameDuration
     var _outputBufferDuration: Double?
     var _sampleRate = _Constants.preferedSampleRate
+    var _inputSource = InputSource.microphone
     var buffer = AudioOutputRing(minimumCapacity: 2048)
     var inputRing = AudioInputRing(minimumCapacity: 2048)
     /// Guards the `buffer` / `inputRing` *references* — not their contents (the
@@ -80,6 +138,12 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     var _resetting = false
 
     private var sourceNode: AVAudioSourceNode?
+    /// Present only while the pipeline includes system audio. Typed `Any`
+    /// because `SystemAudioTap` is gated on macOS 14.2 and stored properties
+    /// cannot carry an availability attribute; every use casts under
+    /// `#available`.
+    private var systemAudioTap: Any?
+    private var tapSourceNode: AVAudioSourceNode?
 
     deinit {
         NotificationCenter.default.removeObserver(self)
@@ -124,6 +188,10 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
             name: Channels.methodChannelName.rawValue, binaryMessenger: registrar.messenger)
         let instance = AudioIoPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
+        FlutterEventChannel(
+            name: Channels.sessionEventChannelName.rawValue,
+            binaryMessenger: registrar.messenger
+        ).setStreamHandler(instance.sessionEvents)
         AudioIoPlugin.shared = instance
 
         NotificationCenter.default.addObserver(
@@ -135,7 +203,7 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case Methods.start.rawValue:
-            start(result: result)
+            start(inputSource: InputSource.from(call.arguments), result: result)
         case Methods.stop.rawValue:
             stop()
             result(nil)
@@ -170,37 +238,88 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         _isRunning = false
         buffer.clear()
         inputRing.clear()
+        // A tap's aggregate device is bound to the output device that was the
+        // default when it was built; tearing the pipeline down here makes the
+        // next start rebuild it against whatever is current, and stops the
+        // HAL IO proc while nothing is listening.
+        if systemAudioTap != nil {
+            detachPipeline()
+        }
     }
 
-    public func start(result: @escaping FlutterResult) {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .denied, .restricted:
+    func start(inputSource: InputSource, result: @escaping FlutterResult) {
+        if inputSource.usesSystemAudio && !SystemAudioSupport.isAvailable {
             result(FlutterError(
-                code: AudioIoError.permissionDeniedCode,
-                message: AudioIoError.permissionDeniedMessage,
+                code: AudioIoError.systemAudioUnsupportedCode,
+                message: AudioIoError.systemAudioUnsupportedMessage,
                 details: nil))
             return
-        case .notDetermined:
-            result(FlutterError(
-                code: AudioIoError.permissionDeniedCode,
-                message: AudioIoError.permissionDeniedMessage,
-                details: nil))
-            return
-        case .authorized:
-            break
-        @unknown default:
-            break
         }
+        if inputSource != _inputSource {
+            // The source fixes the capture graph, so a different one means
+            // rebuilding the pipeline from scratch.
+            if _isRunning {
+                stop()
+            }
+            if _isPipelineSetup {
+                detachPipeline()
+            }
+            _inputSource = inputSource
+        }
+        guard inputSource.usesMicrophone else {
+            startEngine(result: result)
+            return
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            startEngine(result: result)
+        case .notDetermined:
+            // permission_handler has no macOS implementation, so the plugin
+            // asks itself; the system prompt uses NSMicrophoneUsageDescription.
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async {
+                    if granted {
+                        self.startEngine(result: result)
+                    } else {
+                        result(Self.permissionDeniedError())
+                    }
+                }
+            }
+        case .denied, .restricted:
+            result(Self.permissionDeniedError())
+        @unknown default:
+            startEngine(result: result)
+        }
+    }
 
+    private static func permissionDeniedError() -> FlutterError {
+        FlutterError(
+            code: AudioIoError.permissionDeniedCode,
+            message: AudioIoError.permissionDeniedMessage,
+            details: nil)
+    }
+
+    private func startEngine(result: @escaping FlutterResult) {
         do {
             try startInternal()
             result(nil)
-        } catch let error as NSError {
-            result(FlutterError(
-                code: error.domain,
-                message: error.localizedDescription,
-                details: nil))
+        } catch {
+            result(Self.flutterError(for: error))
         }
+    }
+
+    private static func flutterError(for error: Error) -> FlutterError {
+        if let failure = error as? SystemAudioCaptureFailure {
+            return FlutterError(
+                code: AudioIoError.systemAudioCaptureFailedCode,
+                message: failure.description,
+                details: nil)
+        }
+        let nsError = error as NSError
+        return FlutterError(
+            code: nsError.domain,
+            message: nsError.localizedDescription,
+            details: nil)
     }
 
     private func outputRingCapacity() -> Int {
@@ -215,6 +334,12 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
                 * maxFrameJitter))
     }
 
+    private func captureRingCapacity() -> Int {
+        max(
+            _Constants.ringBufferSize,
+            Int(_frameDuration * _sampleRate * maxFrameJitter))
+    }
+
     private func startInternal() throws {
         let newOutputRing = AudioOutputRing(
                 minimumCapacity: outputRingCapacity())
@@ -222,11 +347,10 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         try setupPipelineIfNeeded()
 
         // Sized to the same jitter budget as the output ring, at the capture
-        // rate the pipeline negotiated in setupPipelineIfNeeded().
-        let newInputRing = AudioInputRing(
-            minimumCapacity: max(
-                _Constants.ringBufferSize,
-                Int(_frameDuration * _sampleRate * maxFrameJitter)))
+        // rate the pipeline negotiated in setupPipelineIfNeeded(). A
+        // system-audio-only session drains the tap's own ring instead.
+        let newInputRing =
+            directTapRing() ?? AudioInputRing(minimumCapacity: captureRingCapacity())
 
         // Publish both rings atomically under ringLock so a concurrent FFI
         // export (Dart poll/write isolate) snapshots either the whole old or
@@ -242,6 +366,16 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         inputConverter.outputVolume = 1.0
 
         try engine.start()
+        // The tap only starts once the engine renders, so its ring never fills
+        // (and adds latency) while nothing is draining it.
+        if #available(macOS 14.2, *), let tap = systemAudioTap as? SystemAudioTap {
+            do {
+                try tap.start()
+            } catch {
+                engine.stop()
+                throw error
+            }
+        }
         _isRunning = true
     }
 
@@ -262,35 +396,158 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         return buffer
     }
 
-    public func setupPipelineIfNeeded() throws {
-        if !_isPipelineSetup {
-            let input = engine.inputNode
-            let output = engine.mainMixerNode
-            let inputFormat = input.inputFormat(forBus: 0)
-            _sampleRate = inputFormat.sampleRate
-            inputConverter.outputVolume = 1.0
+    /// A system-audio-only session has no engine input chain: the tap writes
+    /// straight into the plugin's input ring (see `setupPipelineIfNeeded`).
+    private var tapFeedsInputRingDirectly: Bool { _inputSource == .systemAudio }
 
-            let sourceNode = createSourceNode()
+    /// The tap's ring when the tap feeds the input ring directly, else nil.
+    private func directTapRing() -> AudioInputRing? {
+        guard tapFeedsInputRingDirectly, #available(macOS 14.2, *),
+            let tap = systemAudioTap as? SystemAudioTap
+        else { return nil }
+        return tap.ring
+    }
+
+    /// Builds the capture graph for `_inputSource`.
+    ///
+    /// Microphone, and microphone plus system audio (the mixer sums the two):
+    ///
+    ///     inputNode ──┐
+    ///                 ├─▶ inputConverter (mixer) ─▶ sinkNode ─▶ inputRing
+    ///     tapSource ──┘
+    ///
+    /// System audio only:
+    ///
+    ///     SystemAudioTap (HAL IO proc) ─▶ inputRing
+    ///
+    /// `AVAudioSinkNode` is an input-chain terminal: the engine renders it from
+    /// the input unit's I/O cycle, which exists only once `engine.inputNode`
+    /// is in the graph. A system-audio-only session must not instantiate the
+    /// input unit (that is what keeps it free of the microphone grant), so it
+    /// has no input cycle and nothing would ever pull a sink node — the tap
+    /// would fill its ring and `input` would deliver no frames at all. The tap
+    /// therefore writes into the plugin's input ring itself, which the Dart
+    /// FFI poll drains exactly as it drains the microphone ring. The
+    /// processing rate follows the microphone when present (the tap is
+    /// resampled by the mixer), else the tap's own rate.
+    public func setupPipelineIfNeeded() throws {
+        if _isPipelineSetup { return }
+        do {
+            try buildPipeline()
+        } catch {
+            // Nothing of a half-built graph may survive: a retry after a
+            // recoverable tap failure (no output device, grant missing) must
+            // start from a fresh mixer, or the microphone lands on a second
+            // bus and is summed with itself.
+            detachPipeline()
+            throw error
+        }
+    }
+
+    private func buildPipeline() throws {
+        // The tap is the only step that can throw, so it is built before the
+        // graph is touched.
+        if _inputSource.usesSystemAudio, #available(macOS 14.2, *) {
+            systemAudioTap = try SystemAudioTap(ringCapacity: captureRingCapacity())
+        }
+
+        let output = engine.mainMixerNode
+        var captureRate: Double?
+        if _inputSource.usesMicrophone {
+            inputConverter.outputVolume = 1.0
+            engine.attach(inputConverter)
+            engine.attach(sinkNode)
+            let input = engine.inputNode
+            let inputFormat = input.inputFormat(forBus: 0)
+            engine.connect(
+                input, to: inputConverter,
+                fromBus: 0, toBus: inputConverter.nextAvailableInputBus,
+                format: inputFormat)
+            captureRate = inputFormat.sampleRate
+        }
+        if #available(macOS 14.2, *), let tap = systemAudioTap as? SystemAudioTap {
+            captureRate = captureRate ?? tap.sampleRate
+            if !tapFeedsInputRingDirectly {
+                let node = createTapSourceNode(tap: tap)
+                engine.attach(node)
+                engine.connect(
+                    node, to: inputConverter,
+                    fromBus: 0, toBus: inputConverter.nextAvailableInputBus,
+                    format: node.outputFormat(forBus: 0))
+                tapSourceNode = node
+            }
+        }
+        _sampleRate = captureRate ?? _Constants.preferedSampleRate
+
+        let sourceNode = createSourceNode()
+        engine.attach(sourceNode)
+        if _inputSource.usesMicrophone {
             let processingformat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32, sampleRate: _sampleRate, channels: 1,
                 interleaved: false)
-            engine.attach(inputConverter)
-            engine.attach(sinkNode)
-            engine.attach(sourceNode)
-            engine.connect(input, to: inputConverter, format: inputFormat)
             engine.connect(inputConverter, to: sinkNode, format: processingformat)
-            engine.connect(sourceNode, to: output, format: nil)
-            self.sourceNode = sourceNode
-            _isPipelineSetup = true
+        }
+        engine.connect(sourceNode, to: output, format: nil)
+        self.sourceNode = sourceNode
+        _isPipelineSetup = true
+    }
+
+    /// Renders the tap's mono Float32 ring into the mixer at the tap's sample
+    /// rate, for `microphoneAndSystemAudio` only. The ring is written by the
+    /// aggregate device's IO proc on the default *output* device's clock and
+    /// drained here by the engine's input chain on the default *input*
+    /// device's clock. When both are the same physical device (built-in
+    /// speakers and microphone) the two run in lock-step and a shortfall,
+    /// which is zero-filled, only happens at start-up or across a device
+    /// change. With separate devices (a USB or Bluetooth microphone with the
+    /// internal speakers) the rates differ slightly, so the ring drifts to a
+    /// zero-fill or a drop-newest every few seconds — an audible click in the
+    /// mixed stream. That is a documented limit of the mixed source; the ring
+    /// is not rate-matched. A system-audio-only session has no second clock.
+    @available(macOS 14.2, *)
+    private func createTapSourceNode(tap: SystemAudioTap) -> AVAudioSourceNode {
+        let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: tap.sampleRate, channels: 1,
+            interleaved: false)!
+        let ring = tap.ring
+        return AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
+            let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
+            guard let first = ablPointer.first,
+                let data = first.mData?.assumingMemoryBound(to: Float.self)
+            else { return noErr }
+            let frames = Int(frameCount)
+            let read = ring.read(into: data, maxCount: frames)
+            if read < frames {
+                (data + read).initialize(repeating: 0, count: frames - read)
+            }
+            return noErr
+        }
+    }
+
+    private func detachIfAttached(_ node: AVAudioNode) {
+        if engine.attachedNodes.contains(node) {
+            engine.detach(node)
         }
     }
 
     public func detachPipeline() {
-        engine.detach(inputConverter)
-        engine.detach(sinkNode)
+        detachIfAttached(inputConverter)
+        detachIfAttached(sinkNode)
         if let sourceNode = sourceNode {
-            engine.detach(sourceNode)
+            detachIfAttached(sourceNode)
+            self.sourceNode = nil
         }
+        if let tapSourceNode = tapSourceNode {
+            detachIfAttached(tapSourceNode)
+            self.tapSourceNode = nil
+        }
+        if #available(macOS 14.2, *), let tap = systemAudioTap as? SystemAudioTap {
+            tap.stop()
+        }
+        systemAudioTap = nil
+        // A fresh mixer: detaching does not reset its consumed input busses,
+        // so re-connecting the same instance would land on ever-higher busses.
+        inputConverter = AVAudioMixerNode()
         _isPipelineSetup = false
     }
 
@@ -298,13 +555,24 @@ public class AudioIoPlugin: NSObject, FlutterPlugin {
         resetAudio()
     }
 
+    /// Rebuilds the pipeline after a configuration change. A rebuild can fail
+    /// for every reason `start` can (the tap is recreated against the new
+    /// default output device), so a failure ends the session and is pushed to
+    /// Dart: a later `start()` is then a clean rebuild instead of a no-op on
+    /// a session that only claims to run.
     public func resetAudio() {
         if _isRunning && !_resetting {
             _resetting = true
             engine.stop()
             detachPipeline()
             DispatchQueue.main.async {
-                try? self.startInternal()
+                do {
+                    try self.startInternal()
+                } catch {
+                    self._isRunning = false
+                    self.detachPipeline()
+                    self.sessionEvents.sink?(Self.flutterError(for: error))
+                }
                 self._resetting = false
             }
         }

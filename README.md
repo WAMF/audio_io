@@ -15,7 +15,7 @@ Try the PCM16 streaming + Gemini Live example in your browser:
 - Cross-platform support (iOS, macOS, Android, Web, Linux, Windows)
 - Simple Stream-based API
 - PCM16 byte streams at 16/24/48 kHz for realtime voice APIs (e.g. Gemini Live)
-- System-audio (loopback) capture on Windows — record what the machine is playing
+- System-audio (loopback) capture on Windows, macOS, and the web — record what the machine is playing, alone or mixed with the microphone
 - Configurable audio latency modes
 - Optional dedicated audio isolate on FFI platforms
 - Consistent data format across all platforms (Float64, 48kHz, mono)
@@ -271,12 +271,76 @@ await audioIo.startWith(const AudioIoConfig(
 ));
 ```
 
-| Platform | System audio | Mechanism |
-|----------|--------------|-----------|
-| Windows  | ✅ Supported (build 20348+) | WASAPI loopback (`ma_device_type_loopback`) |
-| macOS    | ⛔ Not yet | Core Audio process taps (macOS 14.2+) — planned (#32) |
-| Linux    | ⛔ Not yet | PulseAudio/PipeWire monitor sources — planned |
-| Android / iOS / Web | ⛔ Not supported | — |
+| Platform | System audio | Mic + system audio | Mechanism |
+|----------|--------------|--------------------|-----------|
+| Windows  | ✅ Supported (build 20348+) | ⛔ | WASAPI loopback (`ma_device_type_loopback`) |
+| macOS    | ✅ Supported (14.2+) | ✅ Supported (14.2+) | Core Audio process taps, mixed by AVAudioEngine |
+| Web      | ✅ Chromium | ⛔ | `getDisplayMedia` (see above) |
+| Linux    | ⛔ Not yet | ⛔ | PulseAudio/PipeWire monitor sources — planned |
+| Android / iOS | ⛔ Not supported | ⛔ | — |
+
+**Microphone + system audio.** `AudioIoInputSource.microphoneAndSystemAudio`
+sums both into the one mono input stream — for a voice assistant that must
+keep hearing its user while it listens to a meeting playing on the machine.
+macOS only for now; other back ends throw `isSystemAudioUnsupported`.
+
+#### macOS
+
+System audio is captured through a
+[Core Audio process tap](https://developer.apple.com/documentation/CoreAudio/capturing-system-audio-with-core-audio-taps)
+(macOS 14.2+): a private aggregate device pairs the default output device
+with a global tap that excludes this process, so audio the app plays through
+the output stream is not fed back into the input. If the plugin cannot
+resolve its own process for that exclusion list, `startWith` throws
+`isSystemAudioCaptureFailed` instead of capturing everything. For
+`systemAudio` the tap writes straight into the input ring the Dart side
+drains; for `microphoneAndSystemAudio` it is rendered into the plugin's
+AVAudioEngine mixer alongside the microphone. The captured audio keeps
+playing out of the speakers.
+
+- **Info.plist:** add `NSAudioCaptureUsageDescription` — the first tap
+  triggers a **System Audio Recording** permission prompt (its own TCC
+  category, separate from the microphone). Sandboxed apps also need
+  `com.apple.security.device.audio-input`. Keep the deployment target at
+  14.4 or newer if you can: earlier targets land the prompt in a different TCC
+  category with different copy.
+- **Permission is prompted, not pre-checked:** there is no public API to read
+  the audio-capture grant. If the user denies it the tap produces silence
+  rather than an error; `tccutil reset AudioCapture <bundle-id>` resets it
+  while testing. The prompt only fires for a signed app, and TCC attributes
+  the request to the *responsible* process: an app launched by the `flutter`
+  tool from a terminal is attributed to that terminal, which has no
+  `NSAudioCaptureUsageDescription`, so the request is denied silently. Launch
+  the app from Finder or `open` to be prompted as the app itself, or grant
+  the terminal *System Audio Recording Only* in System Settings > Privacy &
+  Security.
+- **Microphone:** `permission_handler` has no macOS implementation, so the
+  plugin requests microphone access itself (`NSMicrophoneUsageDescription`)
+  when a source that includes the microphone starts and access is not yet
+  determined. A system-audio-only session never touches the microphone.
+- **Errors:** macOS older than 14.2 throws `isSystemAudioUnsupported`; a tap
+  or aggregate-device failure throws an `AudioIoException` with
+  `isSystemAudioCaptureFailed` and the failing call plus `OSStatus` in the
+  message.
+- **Device changes:** the aggregate follows the output device that was the
+  default when capture started; the engine's configuration-change reset
+  rebuilds it, and every `stop` tears it down so the next start binds to the
+  current default. If the rebuild fails, the session ends and the failure is
+  reported on `AudioIo.sessionErrors`; the next `start` rebuilds from
+  scratch.
+- **Mixed source and two clocks:** for `microphoneAndSystemAudio` the tap
+  ring is written on the output device's clock and drained on the input
+  device's clock, and it is not rate-matched. Built-in speakers with the
+  built-in microphone share one clock and are fine; a USB or Bluetooth
+  microphone with the internal speakers drifts, and the ring zero-fills or
+  drops a buffer every few seconds — an audible click in the mixed stream.
+- **What is tested:** the XCTest target (`example/macos/RunnerTests`)
+  covers the tap's pure helpers only — the interleaved and planar downmix
+  and the aggregate-device description. The capture itself, and the
+  own-process exclusion, are asserted by
+  `example/integration_test/system_audio_test.dart` on a macOS host with
+  the grant: another process's speech is heard, then the app's own tone is
+  not, in the same session.
 
 **Own-process exclusion.** On Windows the host process is excluded from the
 loopback capture (`wasapi.loopbackProcessID` + `loopbackProcessExclude`), so an

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'audio_io_exception.dart';
 import 'audio_io_input_source.dart';
 import 'audio_io_threading.dart';
 
@@ -12,6 +13,12 @@ abstract class AudioIoImpl {
 
   Future<void> start();
   Future<void> stop();
+
+  /// Failures the engine reports after [start] returned, for a session that
+  /// can no longer deliver audio (e.g. the macOS system-audio tap could not
+  /// be rebuilt after a device change). Back ends without such a signal
+  /// never emit.
+  Stream<AudioIoException> get sessionErrors => const Stream.empty();
 
   /// Discards audio queued for playback but not yet rendered.
   Future<void> clearOutput();

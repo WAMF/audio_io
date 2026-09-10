@@ -120,9 +120,11 @@ class AudioIoConfig {
   /// Which source the input stream captures from. Defaults to
   /// [AudioIoInputSource.microphone]. [AudioIoInputSource.systemAudio]
   /// captures the machine's audio mix (Windows via WASAPI loopback, macOS
-  /// via Core Audio taps) and throws an [AudioIoException] with
+  /// via Core Audio taps, web via `getDisplayMedia`) and
+  /// [AudioIoInputSource.microphoneAndSystemAudio] sums the microphone into
+  /// it (macOS). Both throw an [AudioIoException] with
   /// [AudioIoException.isSystemAudioUnsupported] on platforms/backends that
-  /// cannot provide it.
+  /// cannot provide them.
   final AudioIoInputSource inputSource;
 
   /// Optional cap on how much audio the output ring may hold, in seconds of
@@ -215,7 +217,6 @@ class AudioIo {
   /// second startWith.
   Sink<Uint8List> get outputBytes => _pcm16.outputBytes;
 
-
   static final _fallbackController = StreamController<List<double>>();
 
   Stream<List<double>> get input =>
@@ -223,6 +224,16 @@ class AudioIo {
 
   Sink<List<double>> get output =>
       _impl.outputAudioStream ?? _fallbackController.sink;
+
+  /// Failures the engine reports after [start] or [startWith] returned.
+  ///
+  /// An event means the session has ended on the native side and [input]
+  /// delivers nothing more until the next [start]. The one producer today is
+  /// macOS: when the system-audio tap cannot be rebuilt after an audio device
+  /// change, the failure arrives here with the same codes `startWith` throws
+  /// (`isSystemAudioCaptureFailed` for a tap or aggregate-device failure).
+  /// Other platforms never emit.
+  Stream<AudioIoException> get sessionErrors => _impl.sessionErrors;
 
   Future<void> start() async {
     // A plain start() is the legacy microphone contract. startWith sets

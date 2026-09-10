@@ -1,7 +1,11 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'audio_io_exception.dart';
+import 'audio_io_input_source.dart';
 import 'audio_io_stub.dart';
 import 'audio_io_threading.dart';
 import 'ffi/audio_io_apple_ffi.dart';
@@ -16,6 +20,17 @@ import 'ffi/audio_io_apple_isolate.dart';
 /// deliver to the root isolate). See issue #27.
 class AudioIoApple extends AudioIoImpl {
   static const String _methodChannelName = 'com.wearemobilefirst.audio_io';
+
+  /// Event channel the macOS plugin pushes session failures on, as
+  /// `PlatformException` error events. The iOS plugin has no handler for it,
+  /// so it is only subscribed on macOS.
+  static const String _sessionEventChannelName =
+      'com.wearemobilefirst.audio_io/session';
+
+  /// Key of the input source in the `start` call's argument map. The value is
+  /// the [AudioIoInputSource] name; the macOS plugin selects its capture
+  /// graph from it and the iOS plugin ignores it (microphone only).
+  static const String inputSourceArgument = 'inputSource';
   static const double _defaultFrameDuration = 0.003;
   static const Map<String, dynamic> _defaultFormat = <String, dynamic>{
     'input': {'type': 'double', 'channels': 1, 'sampleRate': 48000.0},
@@ -23,9 +38,19 @@ class AudioIoApple extends AudioIoImpl {
   };
 
   final MethodChannel _methods = const MethodChannel(_methodChannelName);
+  final EventChannel _sessionEvents =
+      const EventChannel(_sessionEventChannelName);
+
+  /// One shared stream per backend instance. `receiveBroadcastStream()`
+  /// installs the channel's stream handler on its first listener and removes
+  /// it on the last cancel, so a stream built per getter access would let a
+  /// second subscriber replace the first one's handler and a cancel of either
+  /// silence the other. Every subscriber therefore shares this one stream.
+  Stream<AudioIoException>? _sessionErrors;
 
   AudioIoAppleTransport? _transport;
   AudioIoThreading _threading = AudioIoThreading.mainIsolate;
+  AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
   double? _requestedFrameDuration;
   Map<String, dynamic> _format = _defaultFormat;
 
@@ -40,8 +65,51 @@ class AudioIoApple extends AudioIoImpl {
       _transport?.outputAudioStream;
 
   @override
+  Stream<AudioIoException> get sessionErrors {
+    if (defaultTargetPlatform != TargetPlatform.macOS) {
+      return const Stream.empty();
+    }
+    return _sessionErrors ??=
+        _sessionEvents.receiveBroadcastStream().transform(_toSessionErrors);
+  }
+
+  /// Maps the channel's `PlatformException`s to typed [AudioIoException]s;
+  /// anything else is forwarded as an error.
+  static final StreamTransformer<dynamic, AudioIoException> _toSessionErrors =
+      StreamTransformer<dynamic, AudioIoException>.fromHandlers(
+    handleData: (_, __) {},
+    handleError: (error, stackTrace, sink) {
+      if (error is PlatformException) {
+        sink.add(
+          AudioIoException(
+            error.code,
+            error.message ?? 'Unknown error',
+            error.details,
+          ),
+        );
+      } else {
+        sink.addError(error, stackTrace);
+      }
+    },
+  );
+
+  @override
   void configureThreading(AudioIoThreading threading) {
     _threading = threading;
+  }
+
+  @override
+  void configureInputSource(AudioIoInputSource source) {
+    _inputSource = source;
+  }
+
+  @override
+  bool supportsInputSource(AudioIoInputSource source) {
+    // System audio rides on Core Audio process taps (macOS 14.2+, issue #32);
+    // iOS has no equivalent. A macOS host older than 14.2 is only detectable
+    // natively, so the plugin reports it from `start` as the same typed
+    // SYSTEM_AUDIO_UNSUPPORTED error.
+    return !source.includesSystemAudio || Platform.isMacOS;
   }
 
   @override
@@ -49,7 +117,10 @@ class AudioIoApple extends AudioIoImpl {
     // Control plane: start the AVAudioEngine (permission check, session,
     // pipeline, ring allocation). A permission failure surfaces as a
     // PlatformException, which `AudioIo.start` maps to `AudioIoException`.
-    await _methods.invokeMethod<void>('start');
+    await _methods.invokeMethod<void>(
+      'start',
+      <String, dynamic>{inputSourceArgument: _inputSource.name},
+    );
 
     // The native engine and microphone capture are now live. If any of the
     // remaining setup throws — `getFormat` failing, or (the PR's top risk) the
