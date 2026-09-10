@@ -41,6 +41,13 @@ class AudioIoApple extends AudioIoImpl {
   final EventChannel _sessionEvents =
       const EventChannel(_sessionEventChannelName);
 
+  /// One shared stream per backend instance. `receiveBroadcastStream()`
+  /// installs the channel's stream handler on its first listener and removes
+  /// it on the last cancel, so a stream built per getter access would let a
+  /// second subscriber replace the first one's handler and a cancel of either
+  /// silence the other. Every subscriber therefore shares this one stream.
+  Stream<AudioIoException>? _sessionErrors;
+
   AudioIoAppleTransport? _transport;
   AudioIoThreading _threading = AudioIoThreading.mainIsolate;
   AudioIoInputSource _inputSource = AudioIoInputSource.microphone;
@@ -62,25 +69,29 @@ class AudioIoApple extends AudioIoImpl {
     if (defaultTargetPlatform != TargetPlatform.macOS) {
       return const Stream.empty();
     }
-    return _sessionEvents.receiveBroadcastStream().transform(
-      StreamTransformer<dynamic, AudioIoException>.fromHandlers(
-        handleData: (_, __) {},
-        handleError: (error, stackTrace, sink) {
-          if (error is PlatformException) {
-            sink.add(
-              AudioIoException(
-                error.code,
-                error.message ?? 'Unknown error',
-                error.details,
-              ),
-            );
-          } else {
-            sink.addError(error, stackTrace);
-          }
-        },
-      ),
-    );
+    return _sessionErrors ??=
+        _sessionEvents.receiveBroadcastStream().transform(_toSessionErrors);
   }
+
+  /// Maps the channel's `PlatformException`s to typed [AudioIoException]s;
+  /// anything else is forwarded as an error.
+  static final StreamTransformer<dynamic, AudioIoException> _toSessionErrors =
+      StreamTransformer<dynamic, AudioIoException>.fromHandlers(
+    handleData: (_, __) {},
+    handleError: (error, stackTrace, sink) {
+      if (error is PlatformException) {
+        sink.add(
+          AudioIoException(
+            error.code,
+            error.message ?? 'Unknown error',
+            error.details,
+          ),
+        );
+      } else {
+        sink.addError(error, stackTrace);
+      }
+    },
+  );
 
   @override
   void configureThreading(AudioIoThreading threading) {

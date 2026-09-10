@@ -161,7 +161,8 @@ void main() {
   });
 
   group('AudioIo session errors', () {
-    const sessionChannel = EventChannel('com.wearemobilefirst.audio_io/session');
+    const sessionChannel =
+        EventChannel('com.wearemobilefirst.audio_io/session');
 
     tearDown(() {
       debugDefaultTargetPlatformOverride = null;
@@ -191,6 +192,55 @@ void main() {
 
       expect(error.isSystemAudioCaptureFailed, isTrue);
       expect(error.message, contains('AudioHardwareCreateAggregateDevice'));
+    });
+
+    test('separate getter subscriptions share one channel handler', () async {
+      // `receiveBroadcastStream()` installs the channel handler on the first
+      // listener and removes it on the last cancel. A stream built per getter
+      // access gave every subscriber its own handler: the second install
+      // replaced the first, and cancelling either removed it for both, so a
+      // recovery listener could silently miss a session failure.
+      debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
+      MockStreamHandlerEventSink? channelSink;
+      var listens = 0;
+      var cancels = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockStreamHandler(
+        sessionChannel,
+        MockStreamHandler.inline(
+          onListen: (arguments, events) {
+            listens++;
+            channelSink = events;
+          },
+          onCancel: (arguments) => cancels++,
+        ),
+      );
+      final audio = AudioIo.withImpl(AudioIoApple());
+      final first = <AudioIoException>[];
+      final second = <AudioIoException>[];
+
+      final firstSubscription = audio.sessionErrors.listen(first.add);
+      final secondSubscription = audio.sessionErrors.listen(second.add);
+      await pumpEventQueue();
+      expect(listens, 1, reason: 'both subscriptions share one handler');
+
+      channelSink!.error(code: 'SYSTEM_AUDIO_CAPTURE_FAILED', message: 'one');
+      await pumpEventQueue();
+      expect(first.map((e) => e.message), ['one']);
+      expect(second.map((e) => e.message), ['one']);
+
+      await firstSubscription.cancel();
+      await pumpEventQueue();
+      expect(cancels, 0, reason: 'a remaining subscriber keeps the handler');
+
+      channelSink!.error(code: 'SYSTEM_AUDIO_CAPTURE_FAILED', message: 'two');
+      await pumpEventQueue();
+      expect(first.map((e) => e.message), ['one']);
+      expect(second.map((e) => e.message), ['one', 'two']);
+
+      await secondSubscription.cancel();
+      await pumpEventQueue();
+      expect(cancels, 1);
     });
 
     test('is silent on iOS, which has no session event channel', () async {
